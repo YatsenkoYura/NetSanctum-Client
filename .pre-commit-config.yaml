@@ -1,0 +1,38 @@
+minimum_pre_commit_version: "4.6.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: version-check
+        name: verify synchronized application version
+        entry: node scripts/version.mjs check
+        language: system
+        pass_filenames: false
+        files: ^(package(-lock)?\.json|src-tauri/(Cargo\.(toml|lock)|tauri\.conf\.json))$
+
+      - id: frontend-check
+        name: check Svelte and TypeScript
+        entry: npm run check
+        language: system
+        pass_filenames: false
+        files: ^(src/|package(-lock)?\.json|svelte\.config\.js|tsconfig\.json|vite\.config\.ts)
+
+      - id: rustfmt
+        name: check Rust formatting
+        entry: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+        language: system
+        pass_filenames: false
+        files: ^src-tauri/.*\.(rs|toml)$

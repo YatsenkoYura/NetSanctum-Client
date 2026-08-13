@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  RUST_VERSION: "1.88.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run version:check
+      - run: npm run check
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  desktop:
+    name: Desktop compile (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-22.04
+          - os: windows
+            runner: windows-2025
+          - os: macos
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.os }}
+      - run: npm ci
+      - run: npm run build
+      - name: Rust checks
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --check --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Platform tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features
+      - name: Rust dependency audit
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file src-tauri/Cargo.lock
+      - name: Cross-platform release compile
+        run: npm run tauri build -- --no-bundle -- --locked

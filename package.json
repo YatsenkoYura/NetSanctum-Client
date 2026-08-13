@@ -1,0 +1,31 @@
+{
+  "name": "netsanctum-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Native desktop and offline client for NetSanctum",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YatsenkoYura/netsanctum-desktop.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri",
+    "version:check": "node scripts/version.mjs check",
+    "version:set": "node scripts/version.mjs set"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "svelte": "5.56.9"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@tauri-apps/cli": "2.11.4",
+    "svelte-check": "4.7.5",
+    "typescript": "6.0.3",
+    "vite": "8.2.1"
+  }
+}
