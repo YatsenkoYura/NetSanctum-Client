@@ -1,0 +1,41 @@
+[package]
+name = "netsanctum-desktop"
+version = "1.0.0"
+description = "Secure offline desktop companion for NetSanctum"
+authors = ["NetSanctum contributors"]
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-or-later"
+readme = "../README.md"
+repository = "https://github.com/YatsenkoYura/netsanctum-desktop"
+homepage = "https://github.com/YatsenkoYura/netsanctum-desktop"
+keywords = ["desktop", "offline", "self-hosted", "tauri"]
+categories = ["gui", "multimedia"]
+
+[lib]
+name = "netsanctum_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+axum = "0.8.9"
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+cookie = "0.18.2"
+futures-util = "0.3.34"
+getrandom = "0.3.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls", "stream"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+tauri = { version = "2.11.5", features = ["tray-icon", "unstable"] }
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "sync"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+url = { version = "2.5.8", features = ["serde"] }
+zeroize = "1.9.0"
