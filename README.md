@@ -32,6 +32,24 @@ Installers are published on the repository's [GitHub Releases](https://github.co
 
 Early releases are not code-signed. Windows may show an Unknown Publisher/SmartScreen warning. macOS may require allowing the application in Privacy & Security. Download builds only from this repository.
 
+### Arch Linux repository
+
+NetSanctum Desktop publishes an unsigned pacman repository generated from the official Debian release package. Add this block to `/etc/pacman.conf`:
+
+```ini
+[netsanctum]
+SigLevel = Never
+Server = https://github.com/YatsenkoYura/NetSanctum-Desktop/releases/download/arch-repo
+```
+
+Install the application and perform a full system upgrade:
+
+```bash
+sudo pacman -Syu netsanctum-desktop
+```
+
+Future versions are installed by the usual `sudo pacman -Syu`. The repository is delivered over HTTPS and pacman verifies package hashes from its database, but packages are not currently signed.
+
 ## First Start
 
 1. Start or open an existing NetSanctum node.

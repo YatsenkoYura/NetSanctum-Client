@@ -161,3 +161,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release edit "${GITHUB_REF_NAME}" --draft=false
+
+  publish-arch:
+    name: Update Arch repository
+    needs: publish
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+    steps:
+      - name: Start Arch repository workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run arch-repo.yml --ref "${GITHUB_REF_NAME}" -f tag="${GITHUB_REF_NAME}"
