@@ -128,4 +128,4 @@ docs/architecture.md  security and package contracts
 
 ## License
 
-AGPL-3.0-or-later. See `LICENSE`.
+Mozilla Public License 2.0. See `LICENSE`.

@@ -6,6 +6,10 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [1.0.0] - 2026-08-13
 
+### Changed
+
+- Licensed the public desktop client under MPL-2.0.
+
 ### Added
 
 - Secure connection to an existing NetSanctum node.
