@@ -67,7 +67,8 @@ jobs:
         include:
           - name: Linux x86_64
             runner: ubuntu-22.04
-            args: --bundles deb,rpm,appimage
+            args: --bundles deb,rpm
+            appimage: true
           - name: Windows x86_64
             runner: windows-2025
             args: --bundles nsis,msi
@@ -120,6 +121,33 @@ jobs:
           uploadUpdaterJson: false
           releaseAssetNamePattern: NetSanctum-Desktop_[version]_[platform]_[arch]_[bundle][ext]
           args: ${{ matrix.args }} -- --locked
+      - name: Build compatible AppImage
+        if: matrix.appimage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        run: |
+          npm run tauri build -- --bundles appimage -- --locked
+          appimage="$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          rm -rf squashfs-root
+          "$appimage" --appimage-extract >/dev/null
+          rm -f \
+            squashfs-root/usr/lib/libwayland-client.so.0 \
+            squashfs-root/usr/lib/libwayland-cursor.so.0 \
+            squashfs-root/usr/lib/libwayland-egl.so.1 \
+            squashfs-root/usr/lib/libwayland-server.so.0
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "${APPIMAGETOOL_SHA256}  appimagetool.AppImage" | sha256sum --check --strict
+          chmod +x appimagetool.AppImage
+          version="$(node -p "require('./package.json').version")"
+          output="NetSanctum-Desktop_${version}_linux_amd64_appimage.AppImage"
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+            ./appimagetool.AppImage squashfs-root "$output"
+          gh release upload "${GITHUB_REF_NAME}" "$output" --clobber
 
   publish:
     name: Publish release

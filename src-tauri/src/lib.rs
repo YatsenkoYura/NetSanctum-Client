@@ -106,14 +106,6 @@ fn hide_to_tray(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("APPIMAGE").is_some()
-        && std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none()
-    {
-        // WebKitGTK can fail to create an EGL display when an AppImage runs against newer Mesa.
-        // Keep system packages and development builds on the normal accelerated path.
-        unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
-    }
     tauri::Builder::default()
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
