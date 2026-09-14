@@ -1,3 +1,5 @@
+#[cfg(mobile)]
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use cookie::Cookie;
@@ -36,6 +38,15 @@ struct SessionResponse {
     node_name: String,
 }
 
+#[cfg(mobile)]
+#[derive(Debug, Deserialize)]
+struct ApiLoginResponse {
+    access_token: String,
+    expires_in: u64,
+    #[serde(default)]
+    token_type: String,
+}
+
 pub struct DesktopSession {
     pub credential: SessionCredential,
     pub web_cookie: Zeroizing<String>,
@@ -64,25 +75,85 @@ pub struct NodeClient {
 
 impl NodeClient {
     pub fn new() -> AppResult<Self> {
-        let client = Client::builder()
+        let client = Self::client_builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
-            .redirect(Policy::none())
-            .https_only(false)
-            .user_agent(concat!("NetSanctumDesktop/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| AppError::Internal(error.to_string()))?;
-        let download_client = Client::builder()
+        let download_client = Self::client_builder()
             .connect_timeout(Duration::from_secs(15))
-            .redirect(Policy::none())
-            .https_only(false)
-            .user_agent(concat!("NetSanctumDesktop/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| AppError::Internal(error.to_string()))?;
         Ok(Self {
             client,
             download_client,
         })
+    }
+
+    fn client_builder() -> reqwest::ClientBuilder {
+        let builder = Client::builder()
+            .redirect(Policy::none())
+            .https_only(false)
+            .user_agent(concat!("NetSanctumDesktop/", env!("CARGO_PKG_VERSION")));
+        #[cfg(target_os = "android")]
+        let builder = {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            builder.tls_backend_preconfigured(tls)
+        };
+        builder
+    }
+
+    #[cfg(mobile)]
+    fn mobile_auth_client(&self) -> AppResult<Client> {
+        // The public node's POST path stalls over IPv6 while IPv4 is healthy.
+        Self::client_builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(15))
+            .local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)))
+            .build()
+            .map_err(|error| AppError::Internal(error.to_string()))
+    }
+
+    pub async fn diagnose(&self, node_url: &Url) -> AppResult<Vec<String>> {
+        let host = node_url
+            .host_str()
+            .ok_or_else(|| AppError::InvalidNodeUrl("адрес не содержит host".into()))?;
+        let endpoint = node_url
+            .join("auth/login")
+            .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
+        #[cfg(mobile)]
+        let client = self.mobile_auth_client()?;
+        #[cfg(not(mobile))]
+        let client = self.client.clone();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            client
+                .post(endpoint)
+                .header("Accept", "application/json")
+                .json(&serde_json::json!({ "token": "diagnostic-invalid-token" }))
+                .send(),
+        )
+        .await;
+        let mut diagnostics = vec![format!("Узел: {host}; Android auth использует IPv4")];
+        match result {
+            Ok(Ok(response)) => diagnostics.push(format!(
+                "POST /auth/login: HTTP {} за {} мс (401 ожидаем для тестового токена)",
+                response.status(),
+                started.elapsed().as_millis()
+            )),
+            Ok(Err(error)) => diagnostics.push(format!(
+                "POST /auth/login: ошибка {} через {} мс",
+                safe_network_error(&error),
+                started.elapsed().as_millis()
+            )),
+            Err(_) => diagnostics.push("POST /auth/login: timeout после 8 секунд".into()),
+        }
+        Ok(diagnostics)
     }
 
     pub async fn get_authenticated(
@@ -117,6 +188,7 @@ impl NodeClient {
             .map_err(|error| AppError::Download(safe_network_error(&error)))
     }
 
+    #[cfg(not(mobile))]
     pub async fn create_session(
         &self,
         node_url: &Url,
@@ -189,12 +261,103 @@ impl NodeClient {
             ));
         }
 
+        #[cfg(not(mobile))]
+        let web_session = self.create_cookie_session(node_url, master_token).await?;
+        #[cfg(mobile)]
+        let web_cookie = Zeroizing::new(String::new());
+        Ok(DesktopSession {
+            credential: SessionCredential::Bearer(Zeroizing::new(response.access_token)),
+            #[cfg(not(mobile))]
+            web_cookie: web_session.web_cookie,
+            #[cfg(mobile)]
+            web_cookie,
+            expires_in: response.expires_in,
+            node_name: response.node_name,
+        })
+    }
+
+    #[cfg(mobile)]
+    pub async fn create_session(
+        &self,
+        node_url: &Url,
+        master_token: &str,
+    ) -> AppResult<DesktopSession> {
+        self.create_api_session(node_url, master_token).await
+    }
+
+    #[cfg(mobile)]
+    async fn create_api_session(
+        &self,
+        node_url: &Url,
+        master_token: &str,
+    ) -> AppResult<DesktopSession> {
+        let endpoint = node_url
+            .join("auth/login")
+            .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
+        let client = self.mobile_auth_client()?;
+        let started = std::time::Instant::now();
+        eprintln!("NetSanctum mobile auth: starting IPv4-bound POST /auth/login");
+        let response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client
+                .post(endpoint)
+                .header("Accept", "application/json")
+                .json(&serde_json::json!({ "token": master_token }))
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            eprintln!(
+                "NetSanctum mobile auth: request timed out after {} ms",
+                started.elapsed().as_millis()
+            );
+            AppError::NodeUnavailable("превышено время ожидания авторизации".into())
+        })?
+        .map_err(|error| {
+            let safe_error = safe_network_error(&error);
+            eprintln!(
+                "NetSanctum mobile auth: request failed after {} ms: {safe_error}",
+                started.elapsed().as_millis()
+            );
+            AppError::NodeUnavailable(safe_error)
+        })?;
+        eprintln!(
+            "NetSanctum mobile auth: received HTTP {} after {} ms",
+            response.status(),
+            started.elapsed().as_millis()
+        );
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::FORBIDDEN
+        {
+            return Err(AppError::InvalidCredentials);
+        }
+        if !response.status().is_success() {
+            return Err(AppError::UnsupportedNode);
+        }
+        let response: ApiLoginResponse = response
+            .json()
+            .await
+            .map_err(|error| AppError::InvalidNodeResponse(error.to_string()))?;
+        if response.access_token.is_empty()
+            || response.expires_in == 0
+            || response.expires_in > 86_400
+            || (!response.token_type.is_empty()
+                && !response.token_type.eq_ignore_ascii_case("bearer"))
+        {
+            return Err(AppError::InvalidNodeResponse(
+                "узел вернул некорректную временную сессию".into(),
+            ));
+        }
+        let node_name = node_url
+            .host_str()
+            .ok_or_else(|| AppError::InvalidNodeUrl("адрес не содержит host".into()))?
+            .to_owned();
         let web_session = self.create_cookie_session(node_url, master_token).await?;
         Ok(DesktopSession {
             credential: SessionCredential::Bearer(Zeroizing::new(response.access_token)),
             web_cookie: web_session.web_cookie,
             expires_in: response.expires_in,
-            node_name: response.node_name,
+            node_name,
         })
     }
 
@@ -206,8 +369,11 @@ impl NodeClient {
         let login_endpoint = node_url
             .join("auth/ui/login")
             .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
-        let login_response = self
-            .client
+        #[cfg(mobile)]
+        let client = self.mobile_auth_client()?;
+        #[cfg(not(mobile))]
+        let client = self.client.clone();
+        let login_response = client
             .post(login_endpoint)
             .header("Accept", "text/html")
             .form(&[("token", master_token)])
@@ -233,8 +399,7 @@ impl NodeClient {
         let me_endpoint = node_url
             .join("auth/me")
             .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
-        let verification = self
-            .client
+        let verification = client
             .get(me_endpoint)
             .header("Accept", "application/json")
             .header(COOKIE, cookie_header.as_str())

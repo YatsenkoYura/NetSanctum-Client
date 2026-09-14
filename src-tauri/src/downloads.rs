@@ -58,11 +58,29 @@ struct DownloadedResource {
     sha256: String,
 }
 
+struct DownloadContext<'a> {
+    app: &'a AppHandle,
+    state: &'a AppState,
+    session: &'a DownloadSession,
+    package_directory: &'a Path,
+    package_id: &'a str,
+    resource_count: usize,
+}
+
 pub fn enqueue(app: &AppHandle, manifest_url: String) -> AppResult<bool> {
     let state = app.state::<AppState>();
     if !state.reserve_download(&manifest_url)? {
         return Ok(false);
     }
+    emit(
+        app,
+        DownloadEvent {
+            package_id: None,
+            status: "downloading",
+            progress: 0.0,
+            message: "Preparing package download...".into(),
+        },
+    );
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let result = run(&app, &manifest_url).await;
@@ -128,6 +146,7 @@ async fn run(app: &AppHandle, manifest_url: &str) -> AppResult<String> {
         .map_err(|error| AppError::Internal(error.to_string()))?
         .as_secs()
         .to_string();
+
     state.library().begin_package(
         &node_origin,
         &manifest.module.id,
@@ -139,7 +158,8 @@ async fn run(app: &AppHandle, manifest_url: &str) -> AppResult<String> {
         &saved_at,
     )?;
 
-    let package_directory = package_directory(&session, &node_origin, &manifest.package_id);
+    let package_directory =
+        package_directory(&session.data_dir, &node_origin, &manifest.package_id);
     tokio::fs::create_dir_all(&package_directory)
         .await
         .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -178,6 +198,14 @@ async fn download_resources(
     let state = app.state::<AppState>();
     let mut total_size = 0_u64;
     let resource_count = manifest.resources.len();
+    let context = DownloadContext {
+        app,
+        state: &state,
+        session,
+        package_directory,
+        package_id: &manifest.package_id,
+        resource_count,
+    };
     for (index, resource) in manifest.resources.iter().enumerate() {
         emit(
             app,
@@ -188,14 +216,7 @@ async fn download_resources(
                 message: format!("Downloading {}", resource.url),
             },
         );
-        let downloaded = download_resource(
-            &state,
-            state.node_client(),
-            session,
-            resource,
-            package_directory,
-        )
-        .await?;
+        let downloaded = download_resource(&context, resource, index).await?;
         total_size = total_size
             .checked_add(downloaded.byte_size)
             .ok_or_else(|| AppError::Storage("package size overflow".into()))?;
@@ -223,16 +244,21 @@ async fn download_resources(
 }
 
 async fn download_resource(
-    state: &AppState,
-    client: &crate::node::NodeClient,
-    session: &DownloadSession,
+    context: &DownloadContext<'_>,
     resource: &ResourceManifest,
-    package_directory: &Path,
+    resource_index: usize,
 ) -> AppResult<DownloadedResource> {
+    let app = context.app;
+    let state = context.state;
+    let session = context.session;
+    let package_directory = context.package_directory;
+    let package_id = context.package_id;
+    let resource_count = context.resource_count;
     if !state.session_is_current(session.generation) {
         return Err(AppError::SessionMissing);
     }
-    let response = client
+    let response = state
+        .node_client()
         .get_authenticated(&session.node_url, &resource.url, &session.credential)
         .await?;
     if !response.status().is_success() {
@@ -260,6 +286,7 @@ async fn download_resource(
             resource.url
         )));
     }
+    let expected_size = resource.size.or(response.content_length());
     let mime_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -273,6 +300,7 @@ async fn download_resource(
     let mut stream = response.bytes_stream();
     let mut hasher = Sha256::new();
     let mut byte_size = 0_u64;
+    let mut last_percent = (resource_index * 100 / resource_count.max(1)) as u32;
     while let Some(chunk) = stream.next().await {
         if !state.session_is_current(session.generation) {
             drop(file);
@@ -295,6 +323,24 @@ async fn download_resource(
         file.write_all(&chunk)
             .await
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        if let Some(expected_size) = expected_size.filter(|size| *size > 0) {
+            let resource_progress = (byte_size as f64 / expected_size as f64).min(1.0);
+            let progress =
+                (resource_index as f64 + resource_progress) / resource_count.max(1) as f64;
+            let percent = (progress * 100.0) as u32;
+            if percent > last_percent {
+                last_percent = percent;
+                emit(
+                    app,
+                    DownloadEvent {
+                        package_id: Some(package_id.to_owned()),
+                        status: "downloading",
+                        progress,
+                        message: format!("Downloading {}", resource.url),
+                    },
+                );
+            }
+        }
     }
     file.flush()
         .await
@@ -422,9 +468,8 @@ fn validate_relative_url(value: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn package_directory(session: &DownloadSession, node_origin: &str, package_id: &str) -> PathBuf {
-    session
-        .data_dir
+pub(crate) fn package_directory(data_dir: &Path, node_origin: &str, package_id: &str) -> PathBuf {
+    data_dir
         .join("packages")
         .join(digest_hex(node_origin))
         .join(digest_hex(package_id))
@@ -451,6 +496,8 @@ fn digest_hex(value: &str) -> String {
 }
 
 fn emit(app: &AppHandle, event: DownloadEvent) {
+    #[cfg(target_os = "android")]
+    crate::mobile_node::notify_download(app, event.status, event.progress, &event.message);
     let _ = app.emit_to("main", "download-status", event);
 }
 

@@ -227,6 +227,65 @@ impl Library {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
+    pub fn delete_package(&self, node_origin: &str, package_id: &str) -> AppResult<Vec<String>> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let local_paths = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT local_path FROM resources
+                     WHERE node_origin = ?1 AND package_id = ?2",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            statement
+                .query_map(params![node_origin, package_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?
+        };
+        transaction
+            .execute(
+                "DELETE FROM packages WHERE node_origin = ?1 AND package_id = ?2",
+                params![node_origin, package_id],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM modules
+                 WHERE node_origin = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM packages WHERE packages.node_origin = modules.node_origin
+                       AND packages.module_id = modules.module_id
+                   )",
+                params![node_origin],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut orphaned_paths = Vec::new();
+        for path in local_paths {
+            let references: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM resources WHERE local_path = ?1",
+                    params![path],
+                    |row| row.get(0),
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            if references == 0 {
+                orphaned_paths.push(path);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(orphaned_paths)
+    }
+
     pub fn package_root_url(&self, node_origin: &str, package_id: &str) -> AppResult<String> {
         self.connection
             .lock()
@@ -457,5 +516,30 @@ mod tests {
         let library = Library::open(directory.path()).unwrap();
         let modules = library.modules().unwrap();
         assert_eq!("failed", modules[0].packages[0].status);
+    }
+
+    #[test]
+    fn deletes_package_and_empty_module() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        library
+            .begin_package(
+                "https://node.example",
+                "video",
+                "Video",
+                "/video",
+                "video_1",
+                "Example",
+                "/video?package_id=video_1",
+                "1",
+            )
+            .unwrap();
+
+        let orphaned = library
+            .delete_package("https://node.example", "video_1")
+            .unwrap();
+
+        assert!(orphaned.is_empty());
+        assert!(library.modules().unwrap().is_empty());
     }
 }

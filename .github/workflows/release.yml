@@ -50,7 +50,7 @@ jobs:
             --method POST \
             -f tag_name="${GITHUB_REF_NAME}" \
             -f name="NetSanctum Desktop ${GITHUB_REF_NAME}" \
-            -f body='Native desktop and offline client for NetSanctum. Early builds are not code-signed; Windows and macOS may display a publisher warning.' \
+            -f body='Native desktop and offline client for NetSanctum. Desktop builds are not code-signed; Windows and macOS may display a publisher warning.' \
             -F draft=true \
             -F generate_release_notes=true \
             --jq .id)"
@@ -149,9 +149,72 @@ jobs:
             ./appimagetool.AppImage squashfs-root "$output"
           gh release upload "${GITHUB_REF_NAME}" "$output" --clobber
 
+  android:
+    name: Build Android ARM64
+    needs: create-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+      - run: npm ci
+      - run: npm run tauri -- android init
+      - run: npm run tauri -- android build --apk --target aarch64 -- --locked
+      - name: Sign and upload APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/netsanctum-release.jks"
+          shopt -s nullglob
+          apks=(src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk)
+          test "${#apks[@]}" -eq 1
+          version="${GITHUB_REF_NAME#v}"
+          aligned="$RUNNER_TEMP/NetSanctum_${version}_android_arm64_aligned.apk"
+          output="$RUNNER_TEMP/NetSanctum_${version}_android_arm64.apk"
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -p -f 4 "${apks[0]}" "$aligned"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
+            --ks "$RUNNER_TEMP/netsanctum-release.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$output" \
+            "$aligned"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$output"
+          gh release upload "$GITHUB_REF_NAME" "$output"
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

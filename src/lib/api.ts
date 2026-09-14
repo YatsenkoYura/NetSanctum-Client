@@ -43,18 +43,44 @@ export interface ConnectRequest {
   master_token: string;
   vault_password: string;
   allow_insecure_http: boolean;
+  remember_without_password: boolean;
+}
+
+export interface ModuleShortcutTarget {
+  nodeOrigin: string;
+  moduleId: string;
 }
 
 export function bootstrap(): Promise<BootstrapState> {
   return invoke("bootstrap");
 }
 
+export function diagnoseNode(nodeUrl: string, allowInsecureHttp: boolean): Promise<string[]> {
+  return invoke("diagnose_node", { nodeUrl, allowInsecureHttp });
+}
+
+export function downloadPackage(manifestUrl: string): Promise<boolean> {
+  return invoke("download_package", { manifestUrl });
+}
+
 export function connectNode(request: ConnectRequest): Promise<ConnectionState> {
   return invoke("connect_node", { request });
 }
 
+export function saveMobileSession(
+  request: ConnectRequest,
+  accessToken: string,
+  expiresIn: number,
+): Promise<ConnectionState> {
+  return invoke("save_mobile_session", { request, accessToken, expiresIn });
+}
+
 export function disconnectNode(): Promise<ConnectionState> {
   return invoke("disconnect_node");
+}
+
+export function resetConnection(): Promise<ConnectionState> {
+  return invoke("reset_connection");
 }
 
 export function unlockVault(password: string): Promise<ConnectionState> {
@@ -65,8 +91,28 @@ export function openNode(): Promise<void> {
   return invoke("open_node");
 }
 
+export function isMobile(): Promise<boolean> {
+  return invoke("is_mobile");
+}
+
+export function createModuleShortcut(
+  nodeOrigin: string,
+  moduleId: string,
+  name: string,
+): Promise<void> {
+  return invoke("create_module_shortcut", { nodeOrigin, moduleId, name });
+}
+
+export function takeMobileShortcut(): Promise<ModuleShortcutTarget | null> {
+  return invoke("take_mobile_shortcut");
+}
+
 export function listLibrary(): Promise<SavedModule[]> {
   return invoke("list_library");
+}
+
+export function deletePackage(nodeOrigin: string, packageId: string): Promise<SavedModule[]> {
+  return invoke("delete_package", { nodeOrigin, packageId });
 }
 
 export function openOffline(nodeOrigin: string, packageId: string): Promise<void> {

@@ -1,6 +1,6 @@
 [package]
 name = "netsanctum-desktop"
-version = "1.0.0"
+version = "1.1.0"
 description = "Secure offline desktop companion for NetSanctum"
 authors = ["NetSanctum contributors"]
 edition = "2024"
@@ -35,7 +35,11 @@ sha2 = "0.10.9"
 tauri = { version = "2.11.5", features = ["tray-icon", "unstable"] }
 tempfile = "3.27.0"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 url = { version = "2.5.8", features = ["serde"] }
 zeroize = "1.9.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1.0.3"

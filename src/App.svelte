@@ -5,13 +5,20 @@
   import {
     bootstrap,
     connectNode,
+    createModuleShortcut,
+    deletePackage,
+    diagnoseNode,
+    downloadPackage,
     disconnectNode,
     listLibrary,
     hideToTray,
+    isMobile,
     navigateBack,
     openNode,
     openOfflineModule,
+    resetConnection,
     showHome,
+    takeMobileShortcut,
     unlockVault,
     type ConnectionState,
     type SavedModule,
@@ -30,9 +37,16 @@
   let vaultPasswordConfirmation = "";
   let vaultExists = false;
   let allowInsecureHttp = false;
+  let rememberWithoutPassword = false;
   let loading = true;
+  let mobile = false;
   let submitting = false;
+  let connectionProgress = "";
   let error = "";
+  let diagnostics: string[] = [];
+  let diagnosticsOpen = false;
+  let libraryManagerOpen = false;
+  let deletingPackage = "";
   let downloadStatus: { status: string; progress: number; message: string } | null = null;
   const appWindow = getCurrentWindow();
 
@@ -46,11 +60,16 @@
 
   async function initialize() {
     try {
-      const state = await bootstrap();
+      const [state, mobilePlatform] = await Promise.all([bootstrap(), isMobile()]);
       connection = state.connection;
       modules = state.modules;
       vaultExists = state.vault_exists;
       nodeUrl = connection.node_url ?? "";
+      mobile = mobilePlatform;
+      if (mobilePlatform) {
+        const shortcut = await takeMobileShortcut();
+        if (shortcut) await showOfflineModule(shortcut.nodeOrigin, shortcut.moduleId);
+      }
     } catch (cause) {
       error = describeError(cause);
     } finally {
@@ -75,40 +94,85 @@
         downloadStatus = event.payload;
       },
     );
+    const unlistenConnection = listen<string>("connection-progress", (event) => {
+      connectionProgress = event.payload;
+    });
+    const handleDownloadRequest = (event: Event) => {
+      const manifestUrl = (event as CustomEvent<unknown>).detail;
+      if (typeof manifestUrl !== "string") return;
+      void downloadPackage(manifestUrl)
+        .then((queued) => {
+          if (!queued) addDiagnostic("Package уже загружается");
+        })
+        .catch((cause) => {
+          error = describeError(cause);
+        });
+    };
+    window.addEventListener("netsanctum-download-request", handleDownloadRequest);
+    const handleShortcut = (event: Event) => {
+      const target = (event as CustomEvent<{ nodeOrigin?: unknown; moduleId?: unknown }>).detail;
+      if (typeof target?.nodeOrigin === "string" && typeof target?.moduleId === "string") {
+        void showOfflineModule(target.nodeOrigin, target.moduleId);
+      }
+    };
+    window.addEventListener("netsanctum-open-shortcut", handleShortcut);
     void initialize();
     return () => {
       void unlisten.then((stop) => stop());
       void unlistenLibrary.then((stop) => stop());
       void unlistenDownload.then((stop) => stop());
+      void unlistenConnection.then((stop) => stop());
+      window.removeEventListener("netsanctum-download-request", handleDownloadRequest);
+      window.removeEventListener("netsanctum-open-shortcut", handleShortcut);
     };
   });
 
   async function connect() {
     error = "";
-    if (vaultPassword !== vaultPasswordConfirmation) {
+    addDiagnostic("UI: запущено подключение");
+    if (!rememberWithoutPassword && vaultPassword !== vaultPasswordConfirmation) {
       error = "Пароли локального хранилища не совпадают.";
       return;
     }
+    connectionProgress = "Проверяем доступ к узлу…";
     submitting = true;
     try {
-      connection = await connectNode({
+      const request = {
         node_url: nodeUrl,
         master_token: masterToken,
         vault_password: vaultPassword,
         allow_insecure_http: allowInsecureHttp,
-      });
+        remember_without_password: mobile && rememberWithoutPassword,
+      };
+      connection = await connectNode(request);
       vaultExists = true;
       masterToken = "";
       vaultPassword = "";
       vaultPasswordConfirmation = "";
     } catch (cause) {
       error = describeError(cause);
+      addDiagnostic(`Ошибка подключения: ${error}`);
     } finally {
       masterToken = "";
       vaultPassword = "";
       vaultPasswordConfirmation = "";
       submitting = false;
+      connectionProgress = "";
     }
+  }
+
+  async function runDiagnostics() {
+    diagnosticsOpen = true;
+    diagnostics = ["Диагностика native HTTP запущена…"];
+    try {
+      diagnostics = await diagnoseNode(nodeUrl, allowInsecureHttp);
+    } catch (cause) {
+      diagnostics = [`Диагностика не выполнена: ${describeError(cause)}`];
+    }
+  }
+
+  function addDiagnostic(message: string) {
+    diagnostics = [...diagnostics.slice(-19), `${new Date().toLocaleTimeString()}: ${message}`];
   }
 
   async function unlock() {
@@ -144,6 +208,27 @@
     }
   }
 
+  async function resetVault() {
+    if (!confirm("Удалить сохранённый узел и локальный vault? Скачанные пакеты останутся на устройстве.")) {
+      return;
+    }
+    error = "";
+    submitting = true;
+    try {
+      connection = await resetConnection();
+      vaultExists = false;
+      nodeUrl = "";
+      masterToken = "";
+      vaultPassword = "";
+      vaultPasswordConfirmation = "";
+      allowInsecureHttp = false;
+    } catch (cause) {
+      error = describeError(cause);
+    } finally {
+      submitting = false;
+    }
+  }
+
   async function showNode() {
     error = "";
     submitting = true;
@@ -165,8 +250,33 @@
     }
   }
 
+  async function removePackage(item: SavedModule["packages"][number]) {
+    if (!confirm(`Удалить «${item.package_title}» и его файлы с устройства?`)) return;
+    const key = `${item.node_origin}\n${item.package_id}`;
+    deletingPackage = key;
+    error = "";
+    try {
+      modules = await deletePackage(item.node_origin, item.package_id);
+    } catch (cause) {
+      error = describeError(cause);
+    } finally {
+      deletingPackage = "";
+    }
+  }
+
+  async function addModuleShortcut(module: SavedModule) {
+    const host = new URL(module.node_origin).host;
+    const name = prompt("Название ярлыка", `${module.module_title} · ${host}`)?.trim();
+    if (!name) return;
+    try {
+      await createModuleShortcut(module.node_origin, module.module_id, name);
+    } catch (cause) {
+      error = describeError(cause);
+    }
+  }
+
   function describeError(cause: unknown): string {
-    return typeof cause === "string" ? cause : "Не удалось выполнить операцию.";
+    return cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "Не удалось выполнить операцию.";
   }
 
   function formatSize(bytes: number): string {
@@ -181,6 +291,7 @@
   <title>NetSanctum Desktop</title>
 </svelte:head>
 
+{#if !mobile}
 <div class="window-titlebar" data-tauri-drag-region role="toolbar" aria-label="Управление окном">
   <div class="titlebar-nav">
     <button type="button" title="Назад" aria-label="Назад" on:click={() => navigateBack()}>←</button>
@@ -194,8 +305,9 @@
     <button class="window-hide" type="button" title="Скрыть в tray" aria-label="Скрыть в tray" on:click={() => hideToTray()}>×</button>
   </div>
 </div>
+{/if}
 
-<main class="app-shell">
+<main class:mobile class="app-shell">
   <header class="topbar">
     <div class="brand-mark" aria-hidden="true">NS</div>
     <div>
@@ -253,6 +365,9 @@
             {submitting ? "РАЗБЛОКИРОВКА…" : "РАЗБЛОКИРОВАТЬ"}
             <span aria-hidden="true">→</span>
           </button>
+          <button class="secondary-button" type="button" on:click={resetVault} disabled={submitting}>
+            ЗАБЫЛ ПАРОЛЬ VAULT
+          </button>
         </form>
         {:else}
         <form on:submit|preventDefault={connect} autocomplete="off">
@@ -288,8 +403,8 @@
                 type="password"
                 minlength="10"
                 placeholder="Минимум 10 символов"
-                required
-                disabled={submitting || connection.status === "connected"}
+                required={!rememberWithoutPassword}
+                disabled={submitting || connection.status === "connected" || rememberWithoutPassword}
                 autocomplete="new-password"
               />
             </div>
@@ -301,12 +416,22 @@
                 type="password"
                 minlength="10"
                 placeholder="Повторите пароль"
-                required
-                disabled={submitting || connection.status === "connected"}
+                required={!rememberWithoutPassword}
+                disabled={submitting || connection.status === "connected" || rememberWithoutPassword}
                 autocomplete="new-password"
               />
             </div>
           </div>
+
+          {#if mobile}
+            <label class="insecure-option">
+              <input bind:checked={rememberWithoutPassword} type="checkbox" disabled={submitting} />
+              <span>
+                Входить без пароля vault
+                <small>Ключ хранится в защищённом Android Keystore этого устройства.</small>
+              </span>
+            </label>
+          {/if}
 
           <label class="insecure-option">
             <input
@@ -328,7 +453,12 @@
             <div class="connection-message" data-status={connection.status}>{connection.message}</div>
           {/if}
 
-          {#if connection.status === "connected"}
+           {#if connection.status === "connected"}
+            {#if mobile}
+              <div class="connection-message" data-status={connection.status}>
+                Защищённая сессия создана. Узел откроется в отдельном WebView без доступа к Tauri IPC.
+              </div>
+            {/if}
             <button class="primary-button" type="button" on:click={showNode} disabled={submitting}>
               ОТКРЫТЬ УЗЕЛ
               <span aria-hidden="true">→</span>
@@ -338,7 +468,7 @@
             </button>
           {:else}
             <button class="primary-button" type="submit" disabled={submitting}>
-              {submitting ? "ПРОВЕРКА…" : "ПОДКЛЮЧИТЬСЯ"}
+              {submitting ? connectionProgress || "ПРОВЕРКА…" : "ПОДКЛЮЧИТЬСЯ"}
               <span aria-hidden="true">→</span>
             </button>
           {/if}
@@ -352,6 +482,14 @@
             <p>Argon2id + XChaCha20-Poly1305. Пароль и ключ шифрования никогда не записываются на диск.</p>
           </div>
         </div>
+        {#if mobile}
+          <button class="diagnostics-button" type="button" on:click={runDiagnostics} disabled={submitting || !nodeUrl}>
+            ДИАГНОСТИКА NATIVE HTTP
+          </button>
+          {#if diagnosticsOpen}
+            <pre class="diagnostics-log" aria-live="polite">{diagnostics.join("\n")}</pre>
+          {/if}
+        {/if}
       </section>
 
       <section class="library-panel">
@@ -360,7 +498,12 @@
             <p class="eyebrow">LOCAL ARCHIVE</p>
             <h2>Сохранённые модули</h2>
           </div>
-          <div class="module-count"><strong>{modules.length}</strong><span>МОДУЛЕЙ</span></div>
+          <div class="library-heading-actions">
+            <button type="button" on:click={() => (libraryManagerOpen = true)} disabled={modules.length === 0}>
+              УПРАВЛЕНИЕ
+            </button>
+            <div class="module-count"><strong>{modules.length}</strong><span>МОДУЛЕЙ</span></div>
+          </div>
         </div>
 
         {#if downloadStatus}
@@ -396,12 +539,14 @@
                   {#each module.packages.slice(0, 3) as item}
                     <div class="package-row">
                       <span>{item.package_title}</span>
-                      <small>{formatSize(item.byte_size)}</small>
+                      <small data-status={item.status}>
+                        {item.status === "failed" ? "ОШИБКА" : item.status === "downloading" ? "ЗАГРУЗКА" : formatSize(item.byte_size)}
+                      </small>
                     </div>
                   {/each}
                 </div>
                 <footer>
-                  <span>{module.packages.length} сохранено</span>
+                  <span>{module.packages.filter((item) => item.status === "ready").length} доступно / {module.packages.length} всего</span>
                   <button
                     type="button"
                     disabled={!module.packages.some((item) => item.status === "ready")}
@@ -416,3 +561,47 @@
     </div>
   {/if}
 </main>
+
+{#if libraryManagerOpen}
+  <div class="library-manager" role="dialog" aria-modal="true" aria-labelledby="library-manager-title">
+    <header>
+      <div>
+        <p class="eyebrow">LOCAL STORAGE</p>
+        <h2 id="library-manager-title">Управление библиотекой</h2>
+      </div>
+      <button type="button" on:click={() => (libraryManagerOpen = false)}>ЗАКРЫТЬ</button>
+    </header>
+
+    {#if error}
+      <div class="error-message" role="alert">{error}</div>
+    {/if}
+
+    <div class="library-manager-list">
+      {#each modules as module}
+        <article>
+          <div class="library-manager-module-heading">
+            <div>
+              <h3>{module.module_title}</h3>
+              <p>{module.module_id} · {new URL(module.node_origin).host}</p>
+            </div>
+            {#if mobile}
+              <button type="button" on:click={() => addModuleShortcut(module)}>ЯРЛЫК</button>
+            {/if}
+          </div>
+          {#each module.packages as item}
+            {@const key = `${item.node_origin}\n${item.package_id}`}
+            <div class="library-manager-item">
+              <div>
+                <strong>{item.package_title}</strong>
+                <small>{item.status === "failed" ? "Ошибка загрузки" : `${formatSize(item.byte_size)} · ${item.status}`}</small>
+              </div>
+              <button type="button" disabled={deletingPackage === key} on:click={() => removePackage(item)}>
+                {deletingPackage === key ? "УДАЛЕНИЕ…" : "УДАЛИТЬ"}
+              </button>
+            </div>
+          {/each}
+        </article>
+      {/each}
+    </div>
+  </div>
+{/if}

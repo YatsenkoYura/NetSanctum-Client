@@ -15,10 +15,13 @@ use crate::node::{DesktopSession, NodeClient, SessionCredential};
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectRequest {
-    node_url: String,
-    master_token: String,
-    vault_password: String,
-    allow_insecure_http: bool,
+    pub(crate) node_url: String,
+    pub(crate) master_token: String,
+    pub(crate) vault_password: String,
+    pub(crate) allow_insecure_http: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) remember_without_password: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,9 +57,9 @@ impl ConnectionState {
 
 #[derive(Debug, Serialize)]
 pub struct BootstrapState {
-    connection: ConnectionState,
-    modules: Vec<SavedModule>,
-    vault_exists: bool,
+    pub(crate) connection: ConnectionState,
+    pub(crate) modules: Vec<SavedModule>,
+    pub(crate) vault_exists: bool,
 }
 
 struct ActiveSession {
@@ -144,7 +147,14 @@ impl AppState {
         })
     }
 
-    pub async fn connect(&self, mut request: ConnectRequest) -> AppResult<ConnectionState> {
+    pub async fn connect<F>(
+        &self,
+        mut request: ConnectRequest,
+        vault_stage: F,
+    ) -> AppResult<ConnectionState>
+    where
+        F: FnOnce(),
+    {
         let node_url = normalize_node_url(&request.node_url, request.allow_insecure_http)?;
         let master_token = Zeroizing::new(std::mem::take(&mut request.master_token));
         let vault_password = Zeroizing::new(std::mem::take(&mut request.vault_password));
@@ -158,11 +168,67 @@ impl AppState {
             .node_client
             .create_session(&node_url, master_token.trim())
             .await?;
+        vault_stage();
+        self.persist_connection(
+            node_url,
+            request.allow_insecure_http,
+            master_token,
+            vault_password,
+            session,
+        )
+    }
+
+    pub fn save_mobile_session(
+        &self,
+        mut request: ConnectRequest,
+        access_token: String,
+        expires_in: u64,
+    ) -> AppResult<ConnectionState> {
+        let node_url = normalize_node_url(&request.node_url, request.allow_insecure_http)?;
+        let master_token = Zeroizing::new(std::mem::take(&mut request.master_token));
+        let vault_password = Zeroizing::new(std::mem::take(&mut request.vault_password));
+        if master_token.trim().is_empty()
+            || access_token.is_empty()
+            || expires_in == 0
+            || expires_in > 86_400
+        {
+            return Err(AppError::InvalidNodeResponse(
+                "узел вернул некорректную временную сессию".into(),
+            ));
+        }
+        self.credentials
+            .validate_new_password(vault_password.as_str())?;
+        let node_name = node_url
+            .host_str()
+            .ok_or_else(|| AppError::InvalidNodeUrl("адрес не содержит host".into()))?
+            .to_owned();
+        self.persist_connection(
+            node_url,
+            request.allow_insecure_http,
+            master_token,
+            vault_password,
+            DesktopSession {
+                credential: SessionCredential::Bearer(Zeroizing::new(access_token)),
+                web_cookie: Zeroizing::new(String::new()),
+                expires_in,
+                node_name,
+            },
+        )
+    }
+
+    fn persist_connection(
+        &self,
+        node_url: url::Url,
+        allow_insecure_http: bool,
+        master_token: Zeroizing<String>,
+        vault_password: Zeroizing<String>,
+        session: DesktopSession,
+    ) -> AppResult<ConnectionState> {
         self.credentials
             .save(master_token.trim(), vault_password.as_str())?;
         let config = StoredConfig {
             node_url: node_url.clone(),
-            allow_insecure_http: request.allow_insecure_http,
+            allow_insecure_http,
         };
         if let Err(error) = self.config_store.save(&config) {
             let _ = self.credentials.clear();
@@ -319,7 +385,44 @@ impl AppState {
         &self.node_client
     }
 
+    pub async fn diagnose_node(
+        &self,
+        raw_url: String,
+        allow_insecure_http: bool,
+    ) -> AppResult<Vec<String>> {
+        let node_url = normalize_node_url(&raw_url, allow_insecure_http)?;
+        self.node_client.diagnose(&node_url).await
+    }
+
     pub fn saved_modules(&self) -> AppResult<Vec<SavedModule>> {
+        self.library.modules()
+    }
+
+    pub async fn delete_package(
+        &self,
+        node_origin: String,
+        package_id: String,
+    ) -> AppResult<Vec<SavedModule>> {
+        if package_id.is_empty()
+            || matches!(package_id.as_str(), "." | "..")
+            || package_id.len() > 160
+            || !package_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(AppError::InvalidPackage("invalid package_id".into()));
+        }
+        let orphaned_files = self.library.delete_package(&node_origin, &package_id)?;
+        let objects_dir = self.data_dir.join("objects");
+        for path in orphaned_files {
+            let path = PathBuf::from(path);
+            if path.starts_with(&objects_dir) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+        let package_dir =
+            crate::downloads::package_directory(&self.data_dir, &node_origin, &package_id);
+        let _ = tokio::fs::remove_dir_all(package_dir).await;
         self.library.modules()
     }
 

@@ -114,7 +114,7 @@ fn normalize_url(value: &str) -> Option<String> {
     let mut url = base.join(value).ok()?;
     let mut query = url
         .query_pairs()
-        .filter(|(key, _)| key != "package_id" && key != "sort_by")
+        .filter(|(key, _)| key != "package_id" && key != "sort_by" && key != "v")
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     query.sort();
@@ -156,5 +156,6 @@ mod tests {
                 .find_equivalent("/hello?package_id=anything")
                 .is_some()
         );
+        assert!(reader.find_equivalent("/hello?v=cache-buster").is_some());
     }
 }

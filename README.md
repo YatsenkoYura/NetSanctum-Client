@@ -5,7 +5,7 @@ Native desktop and offline client for [NetSanctum](https://github.com/YatsenkoYu
 NetSanctum Desktop connects to an existing node. It does not run Docker, PostgreSQL, Redis, Celery, or module Python code on the user's computer. Online modules are rendered in a sandboxed WebView; selected module packages can be downloaded and opened through the local offline runtime.
 
 > [!WARNING]
-> NetSanctum Desktop 1.0 is the first public release. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
+> NetSanctum Desktop 1.1 adds the Android client. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
 
 ## Features
 
@@ -29,6 +29,7 @@ Installers are published on the repository's [GitHub Releases](https://github.co
 | Windows x86_64 | NSIS `.exe`, `.msi` |
 | macOS Apple Silicon | ARM64 `.dmg` |
 | macOS Intel | x86_64 `.dmg` |
+| Android | signed ARM64 `.apk` |
 
 Early releases are not code-signed. Windows may show an Unknown Publisher/SmartScreen warning. macOS may require allowing the application in Privacy & Security. Download builds only from this repository.
 
@@ -114,6 +115,41 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-f
 cargo test --locked --manifest-path src-tauri/Cargo.toml --all-features
 ```
 
+### Android
+
+The Android target shares the Rust vault,
+connection validation, and library shell with desktop. Live node pages open in
+a separate native WebView with no Tauri IPC bridge. Package manifests are
+validated and downloaded by the Rust core into app-private Android storage.
+Downloaded modules can be opened through the app-private offline runtime.
+
+Install Android Studio with the Android SDK Platform, Platform-Tools, NDK,
+Build-Tools, and Command-line Tools. Install `rustup`, then initialize the
+generated Android project and build an arm64 release APK:
+
+```bash
+rustup target add aarch64-linux-android
+npm run tauri -- android init
+npm run tauri -- android build --apk --target aarch64
+```
+
+The local unsigned APK is written to
+`src-tauri/gen/android/app/build/outputs/apk/universal/release/`. The generated
+Android Studio project remains untracked and can be recreated with
+`npm run tauri -- android init`; `npm run build` copies the tracked native
+WebView plugin into it before each Android build.
+
+Tagged GitHub releases publish a signed ARM64 APK. Configure these repository
+secrets before pushing a release tag:
+
+- `ANDROID_KEYSTORE_BASE64`: base64-encoded release keystore
+- `ANDROID_KEYSTORE_PASSWORD`: keystore password
+- `ANDROID_KEY_ALIAS`: signing key alias
+- `ANDROID_KEY_PASSWORD`: signing key password
+
+Keep the release keystore backed up securely. Android updates must be signed by
+the same key as the installed application.
+
 Optional repository hooks:
 
 ```bash
@@ -125,11 +161,11 @@ pre-commit install
 All version sources are kept in sync by `scripts/version.mjs`.
 
 ```bash
-npm run version:set -- 0.2.0
+npm run version:set -- 1.1.0
 npm run version:check
-git commit -am "chore(release): prepare v0.2.0"
-git tag -a v0.2.0 -m "NetSanctum Desktop v0.2.0"
-git push origin main v0.2.0
+git commit -am "chore(release): prepare v1.1.0"
+git tag -a v1.1.0 -m "NetSanctum Desktop v1.1.0"
+git push origin main v1.1.0
 ```
 
 The tag must exactly match the version in `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`. GitHub Actions builds every installer into a draft and publishes the release only after all jobs succeed.
