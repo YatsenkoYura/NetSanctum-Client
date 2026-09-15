@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "netsanctum-desktop"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "argon2",
  "axum",

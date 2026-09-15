@@ -49,8 +49,8 @@ jobs:
           id="$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
             --method POST \
             -f tag_name="${GITHUB_REF_NAME}" \
-            -f name="NetSanctum Desktop ${GITHUB_REF_NAME}" \
-            -f body='Native desktop and offline client for NetSanctum. Desktop builds are not code-signed; Windows and macOS may display a publisher warning.' \
+            -f name="Netsanctum Client ${GITHUB_REF_NAME}" \
+            -f body='Native desktop and mobile client for NetSanctum with an offline runtime. Desktop builds are not code-signed; Windows and macOS may display a publisher warning.' \
             -F draft=true \
             -F generate_release_notes=true \
             --jq .id)"
@@ -119,7 +119,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
           uploadUpdaterJson: false
-          releaseAssetNamePattern: NetSanctum-Desktop_[version]_[platform]_[arch]_[bundle][ext]
+          releaseAssetNamePattern: Netsanctum-Client_[version]_[platform]_[arch]_[bundle][ext]
           args: ${{ matrix.args }} -- --locked
       - name: Build compatible AppImage
         if: matrix.appimage
@@ -144,7 +144,7 @@ jobs:
           echo "${APPIMAGETOOL_SHA256}  appimagetool.AppImage" | sha256sum --check --strict
           chmod +x appimagetool.AppImage
           version="$(node -p "require('./package.json').version")"
-          output="NetSanctum-Desktop_${version}_linux_amd64_appimage.AppImage"
+          output="Netsanctum-Client_${version}_linux_amd64_appimage.AppImage"
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
             ./appimagetool.AppImage squashfs-root "$output"
           gh release upload "${GITHUB_REF_NAME}" "$output" --clobber
@@ -202,8 +202,8 @@ jobs:
           apks=(src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk)
           test "${#apks[@]}" -eq 1
           version="${GITHUB_REF_NAME#v}"
-          aligned="$RUNNER_TEMP/NetSanctum_${version}_android_arm64_aligned.apk"
-          output="$RUNNER_TEMP/NetSanctum_${version}_android_arm64.apk"
+          aligned="$RUNNER_TEMP/Netsanctum-Client_${version}_android_arm64_aligned.apk"
+          output="$RUNNER_TEMP/Netsanctum-Client_${version}_android_arm64.apk"
           "$ANDROID_HOME/build-tools/36.0.0/zipalign" -p -f 4 "${apks[0]}" "$aligned"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign \
             --ks "$RUNNER_TEMP/netsanctum-release.jks" \

@@ -1,8 +1,8 @@
-# NetSanctum Desktop Architecture
+# Netsanctum Client Architecture
 
 ## Product boundary
 
-NetSanctum Desktop connects to an existing NetSanctum node. It does not run PostgreSQL, Redis, Celery, Docker, or module Python code locally.
+Netsanctum Client connects to an existing NetSanctum node. It does not run PostgreSQL, Redis, Celery, Docker, or module Python code locally.
 
 The application has two trust domains:
 
@@ -20,7 +20,7 @@ The master token is stored in an application-owned, cross-platform encrypted env
 - Argon2id v1.3 derives a 256-bit key from the user's vault password and a random 128-bit salt.
 - Production KDF parameters are 64 MiB memory, three iterations, and one lane.
 - XChaCha20-Poly1305 encrypts and authenticates the master token with a random 192-bit nonce.
-- Ciphertext is bound to the NetSanctum Desktop vault format through fixed associated data; modified KDF parameters produce authentication failure.
+- Ciphertext is bound to the Netsanctum Client vault format through fixed associated data; modified KDF parameters produce authentication failure.
 - KDF parameters read from disk are bounded before allocation to prevent modified-file resource exhaustion.
 - The vault file is written through fsync and atomic rename; Unix permissions are `0600` in a `0700` directory.
 - Passwords, derived keys, plaintext, and the in-memory master token use zeroizing containers.
@@ -41,7 +41,7 @@ Request:
 {
   "master_token": "secret",
   "client": {
-    "name": "NetSanctum Desktop",
+    "name": "Netsanctum Client",
     "version": "0.1.0",
     "protocol_version": 1
   }

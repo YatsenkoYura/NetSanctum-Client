@@ -286,6 +286,7 @@ impl Library {
         Ok(orphaned_paths)
     }
 
+    #[cfg(not(mobile))]
     pub fn package_root_url(&self, node_origin: &str, package_id: &str) -> AppResult<String> {
         self.connection
             .lock()
@@ -295,6 +296,47 @@ impl Library {
                  WHERE node_origin = ?1 AND package_id = ?2 AND status = 'ready'",
                 params![node_origin, package_id],
                 |row| row.get(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub fn package_module_info(
+        &self,
+        node_origin: &str,
+        package_id: &str,
+    ) -> AppResult<(String, String, String, String)> {
+        self.connection
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?
+            .query_row(
+                "SELECT packages.root_url, modules.module_id, modules.module_title,
+                        modules.module_root_url
+                 FROM packages
+                 JOIN modules ON modules.node_origin = packages.node_origin
+                   AND modules.module_id = packages.module_id
+                 WHERE packages.node_origin = ?1 AND packages.package_id = ?2
+                   AND packages.status = 'ready'",
+                params![node_origin, package_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub fn module_identity(
+        &self,
+        node_origin: &str,
+        module_id: &str,
+    ) -> AppResult<(String, String)> {
+        self.connection
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?
+            .query_row(
+                "SELECT module_title, module_root_url FROM modules
+                 WHERE node_origin = ?1 AND module_id = ?2",
+                params![node_origin, module_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| AppError::Storage(error.to_string()))
     }
@@ -541,5 +583,44 @@ mod tests {
 
         assert!(orphaned.is_empty());
         assert!(library.modules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn returns_module_identity_for_ready_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        library
+            .begin_package(
+                "https://node.example",
+                "video",
+                "Video",
+                "/video",
+                "video_1",
+                "Example",
+                "/video?package_id=video_1",
+                "1",
+            )
+            .unwrap();
+        library
+            .finish_package("https://node.example", "video_1", "ready", 42)
+            .unwrap();
+
+        assert_eq!(
+            library
+                .package_module_info("https://node.example", "video_1")
+                .unwrap(),
+            (
+                "/video?package_id=video_1".into(),
+                "video".into(),
+                "Video".into(),
+                "/video".into(),
+            )
+        );
+        assert_eq!(
+            library
+                .module_identity("https://node.example", "video")
+                .unwrap(),
+            ("Video".into(), "/video".into())
+        );
     }
 }

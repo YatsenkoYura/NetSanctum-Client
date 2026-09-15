@@ -1,8 +1,8 @@
 {
   "name": "netsanctum-desktop",
   "private": true,
-  "version": "2.0.0",
-  "description": "Native desktop and offline client for NetSanctum",
+  "version": "2.0.1",
+  "description": "Native client and offline runtime for NetSanctum",
   "license": "MPL-2.0",
   "repository": {
     "type": "git",

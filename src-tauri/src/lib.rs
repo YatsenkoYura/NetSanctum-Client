@@ -52,6 +52,14 @@ async fn diagnose_node(
 }
 
 #[tauri::command]
+async fn shortcut_online_available(
+    state: State<'_, AppState>,
+    node_origin: String,
+) -> AppResult<bool> {
+    state.shortcut_online_available(&node_origin).await
+}
+
+#[tauri::command]
 fn download_package(app: AppHandle, manifest_url: String) -> AppResult<bool> {
     downloads::enqueue(&app, manifest_url)
 }
@@ -136,6 +144,14 @@ async fn unlock_vault(
 }
 
 #[tauri::command]
+async fn unlock_shortcut(
+    state: State<'_, AppState>,
+    password: String,
+) -> AppResult<ConnectionState> {
+    state.unlock(password).await
+}
+
+#[tauri::command]
 fn open_node(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(not(mobile))]
     {
@@ -151,6 +167,23 @@ fn open_node(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
         Err(crate::error::AppError::Internal(
             "Live node browsing is not available on this platform yet.".into(),
         ))
+    }
+}
+
+#[tauri::command]
+fn open_node_module(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    module_path: String,
+) -> AppResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        mobile_node::open_path(&app, &state, Some(&module_path))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = module_path;
+        node_view::open(&app, &state)
     }
 }
 
@@ -209,11 +242,32 @@ async fn open_offline(
     {
         return offline_view::open(&app, &state, node_origin, package_id).await;
     }
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
+    {
+        let (root_url, module_id, module_title, module_path) = state
+            .library()
+            .package_module_info(&node_origin, &package_id)?;
+        let access = state
+            .offline_gateway()
+            .await?
+            .activate(node_origin.clone(), package_id)
+            .await?;
+        let target = format!("{}{}", access.origin, root_url);
+        mobile_node::open_offline(
+            &app,
+            &target,
+            &node_origin,
+            &module_id,
+            &module_title,
+            &module_path,
+            &access.token,
+        )
+    }
+    #[cfg(all(mobile, not(target_os = "android")))]
     {
         let _ = (app, state, node_origin, package_id);
         Err(crate::error::AppError::Internal(
-            "Offline package browsing is not available in the Android preview yet.".into(),
+            "Offline package browsing is not available on this platform yet.".into(),
         ))
     }
 }
@@ -229,18 +283,35 @@ async fn open_offline_module(
     {
         return offline_view::open_module(&app, &state, node_origin, module_id).await;
     }
-    #[cfg(mobile)]
+    #[cfg(target_os = "android")]
     {
         let (root_url, package_ids) = state
             .library()
             .module_offline_info(&node_origin, &module_id)?;
+        let (module_title, module_path) =
+            state.library().module_identity(&node_origin, &module_id)?;
         let access = state
             .offline_gateway()
             .await?
-            .activate_module(node_origin, package_ids)
+            .activate_module(node_origin.clone(), package_ids)
             .await?;
         let target = format!("{}{}", access.origin, root_url);
-        mobile_node::open_offline(&app, &target, &access.token)
+        mobile_node::open_offline(
+            &app,
+            &target,
+            &node_origin,
+            &module_id,
+            &module_title,
+            &module_path,
+            &access.token,
+        )
+    }
+    #[cfg(all(mobile, not(target_os = "android")))]
+    {
+        let _ = (app, state, node_origin, module_id);
+        Err(crate::error::AppError::Internal(
+            "Offline module browsing is not available on this platform yet.".into(),
+        ))
     }
 }
 
@@ -254,15 +325,34 @@ fn create_module_shortcut(
     app: AppHandle,
     node_origin: String,
     module_id: String,
+    module_title: String,
+    module_path: String,
     name: String,
+    icon_text: String,
 ) -> AppResult<()> {
     #[cfg(target_os = "android")]
     {
-        return mobile_node::create_shortcut(&app, &node_origin, &module_id, &name);
+        return mobile_node::create_shortcut(
+            &app,
+            &node_origin,
+            &module_id,
+            &module_title,
+            &module_path,
+            &name,
+            &icon_text,
+        );
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (app, node_origin, module_id, name);
+        let _ = (
+            app,
+            node_origin,
+            module_id,
+            module_title,
+            module_path,
+            name,
+            icon_text,
+        );
         Err(crate::error::AppError::Internal(
             "Module shortcuts are only available on Android.".into(),
         ))
@@ -346,11 +436,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             diagnose_node,
+            shortcut_online_available,
             download_package,
             connect_node,
             save_mobile_session,
             unlock_vault,
+            unlock_shortcut,
             open_node,
+            open_node_module,
             disconnect_node,
             reset_connection,
             list_library,
@@ -365,5 +458,5 @@ pub fn run() {
             hide_to_tray
         ])
         .run(tauri::generate_context!())
-        .expect("NetSanctum Desktop runtime failed");
+        .expect("Netsanctum Client runtime failed");
 }

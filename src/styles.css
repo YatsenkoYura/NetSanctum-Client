@@ -718,6 +718,113 @@ input:disabled {
   background-size: 36px 36px;
 }
 
+.shortcut-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 11000;
+  display: grid;
+  place-items: center;
+  padding: max(20px, env(safe-area-inset-top, 0)) max(20px, env(safe-area-inset-right, 0))
+    max(20px, env(safe-area-inset-bottom, 0)) max(20px, env(safe-area-inset-left, 0));
+  background: rgba(2, 5, 4, 0.92);
+  backdrop-filter: blur(8px);
+}
+
+.shortcut-panel {
+  width: min(620px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  border: 1px solid #21483f;
+  background: #080e0b;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+
+.shortcut-panel > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #1c302b;
+}
+
+.shortcut-panel h2,
+.shortcut-panel p {
+  margin: 0;
+}
+
+.shortcut-panel header small {
+  display: block;
+  margin-top: 5px;
+  color: #788780;
+  font-family: ui-monospace, monospace;
+}
+
+.shortcut-panel > header button {
+  border: 0;
+  background: transparent;
+  color: #8fa099;
+  font: 700 10px/1 ui-monospace, monospace;
+  letter-spacing: 0.08em;
+}
+
+.shortcut-panel form,
+.shortcut-explanation,
+.shortcut-empty,
+.shortcut-panel > .error-message,
+.shortcut-panel > .secondary-button {
+  margin: 20px;
+}
+
+.shortcut-panel form p {
+  margin-bottom: 20px;
+  color: #9caaa4;
+}
+
+.shortcut-options {
+  display: grid;
+  gap: 8px;
+  padding: 0 20px 20px;
+}
+
+.shortcut-options button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid #1b3731;
+  background: #0b1511;
+  color: #dce6e1;
+  text-align: left;
+}
+
+.shortcut-options button:hover {
+  border-color: #2dd4bf;
+  background: #0d201a;
+}
+
+.shortcut-options button > span {
+  display: grid;
+  gap: 4px;
+}
+
+.shortcut-options button > span:last-child {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.shortcut-options small {
+  color: #73827b;
+}
+
+.shortcut-empty {
+  padding: 20px;
+  border: 1px dashed #31413b;
+  color: #87958f;
+}
+
 .library-manager > header {
   display: flex;
   align-items: flex-start;

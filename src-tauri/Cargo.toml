@@ -1,7 +1,7 @@
 [package]
 name = "netsanctum-desktop"
-version = "2.0.0"
-description = "Secure offline desktop companion for NetSanctum"
+version = "2.0.1"
+description = "Secure offline client companion for NetSanctum"
 authors = ["NetSanctum contributors"]
 edition = "2024"
 rust-version = "1.88"
@@ -9,7 +9,7 @@ license = "MPL-2.0"
 readme = "../README.md"
 repository = "https://github.com/YatsenkoYura/netsanctum-desktop"
 homepage = "https://github.com/YatsenkoYura/netsanctum-desktop"
-keywords = ["desktop", "offline", "self-hosted", "tauri"]
+keywords = ["client", "desktop", "mobile", "offline", "self-hosted", "tauri"]
 categories = ["gui", "multimedia"]
 
 [lib]

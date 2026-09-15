@@ -20,7 +20,8 @@ const MEMORY_KIB: u32 = 65_536;
 const ITERATIONS: u32 = 3;
 const PARALLELISM: u32 = 1;
 const MIN_PASSWORD_CHARS: usize = 10;
-const ASSOCIATED_DATA: &[u8] = b"NetSanctum Desktop credential vault v1";
+const ASSOCIATED_DATA: &[u8] = b"Netsanctum Client credential vault v1";
+const LEGACY_ASSOCIATED_DATA: &[u8] = b"NetSanctum Desktop credential vault v1";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct VaultEnvelope {
@@ -82,17 +83,25 @@ impl CredentialStore {
         let key = derive_key(password, &salt, &envelope.kdf)?;
         let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| AppError::Internal("не удалось создать vault cipher".into()))?;
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(
+        let decrypted = cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: ASSOCIATED_DATA,
+                },
+            )
+            .or_else(|_| {
+                cipher.decrypt(
                     XNonce::from_slice(&nonce),
                     Payload {
                         msg: &ciphertext,
-                        aad: ASSOCIATED_DATA,
+                        aad: LEGACY_ASSOCIATED_DATA,
                     },
                 )
-                .map_err(|_| AppError::InvalidVaultPassword)?,
-        );
+            })
+            .map_err(|_| AppError::InvalidVaultPassword)?;
+        let plaintext = Zeroizing::new(decrypted);
         let token = std::str::from_utf8(plaintext.as_ref())
             .map_err(|_| AppError::Storage("vault содержит некорректный UTF-8".into()))?
             .to_owned();
@@ -240,5 +249,54 @@ mod tests {
             vault.save("master-token-value", "short"),
             Err(AppError::WeakVaultPassword)
         ));
+    }
+
+    #[test]
+    fn decrypts_legacy_vault_with_previous_associated_data() {
+        use super::{
+            BASE64, KdfDescriptor, LEGACY_ASSOCIATED_DATA, NONCE_LENGTH, SALT_LENGTH,
+            VAULT_VERSION, VaultEnvelope, derive_key,
+        };
+        use base64::Engine;
+        use chacha20poly1305::{
+            KeyInit, XChaCha20Poly1305, XNonce,
+            aead::{Aead, Payload},
+        };
+
+        let directory = tempdir().unwrap();
+        let salt = [1_u8; SALT_LENGTH];
+        let nonce = [2_u8; NONCE_LENGTH];
+        let kdf = KdfDescriptor {
+            algorithm: "argon2id".into(),
+            memory_kib: 32_768,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let key = derive_key("legacy-password-1234", &salt, &kdf).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: b"legacy-token-data",
+                    aad: LEGACY_ASSOCIATED_DATA,
+                },
+            )
+            .unwrap();
+        let envelope = VaultEnvelope {
+            version: VAULT_VERSION,
+            kdf,
+            salt: BASE64.encode(salt),
+            nonce: BASE64.encode(nonce),
+            ciphertext: BASE64.encode(ciphertext),
+        };
+        let payload = serde_json::to_vec_pretty(&envelope).unwrap();
+        std::fs::write(directory.path().join("credentials.vault"), payload).unwrap();
+
+        let vault = CredentialStore::new(directory.path());
+        assert_eq!(
+            vault.read("legacy-password-1234").unwrap().as_str(),
+            "legacy-token-data"
+        );
     }
 }

@@ -394,6 +394,21 @@ impl AppState {
         self.node_client.diagnose(&node_url).await
     }
 
+    pub async fn shortcut_online_available(&self, node_origin: &str) -> AppResult<bool> {
+        let session = match self.node_view_session() {
+            Ok(session) => session,
+            Err(AppError::SessionMissing) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if session.node_url.as_str().trim_end_matches('/') != node_origin.trim_end_matches('/') {
+            return Ok(false);
+        }
+        let credential = SessionCredential::Cookie(session.cookie_value);
+        self.node_client
+            .check_authenticated(&session.node_url, &credential)
+            .await
+    }
+
     pub fn saved_modules(&self) -> AppResult<Vec<SavedModule>> {
         self.library.modules()
     }

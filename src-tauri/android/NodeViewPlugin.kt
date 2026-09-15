@@ -1,6 +1,7 @@
 package dev.netsanctum.desktop
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Dialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -12,6 +13,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -21,14 +23,21 @@ import android.text.TextUtils
 import android.util.Base64
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupWindow
@@ -44,6 +53,7 @@ import androidx.core.graphics.drawable.IconCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -58,6 +68,10 @@ import javax.crypto.spec.GCMParameterSpec
 @InvokeArg
 class OpenNodeArgs {
   lateinit var nodeUrl: String
+  lateinit var nodeOrigin: String
+  lateinit var moduleId: String
+  lateinit var moduleTitle: String
+  lateinit var modulePath: String
   lateinit var cookieName: String
   lateinit var cookieValue: String
 }
@@ -73,7 +87,10 @@ class DownloadNotificationArgs {
 class CreateShortcutArgs {
   lateinit var nodeOrigin: String
   lateinit var moduleId: String
+  lateinit var moduleTitle: String
+  lateinit var modulePath: String
   lateinit var name: String
+  lateinit var iconText: String
 }
 
 @InvokeArg
@@ -84,9 +101,12 @@ class VaultKeyArgs {
 @TauriPlugin
 class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var shellWebView: WebView? = null
+  private var activeNodeDialog: Dialog? = null
   private var notificationPermissionRequested = false
   private var pendingShortcutNode: String? = null
   private var pendingShortcutModule: String? = null
+  private var pendingShortcutTitle: String? = null
+  private var pendingShortcutPath: String? = null
 
   override fun load(webView: WebView) {
     shellWebView = webView
@@ -96,41 +116,27 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
   override fun onNewIntent(intent: Intent) {
     captureShortcut(intent)
-    dispatchPendingShortcut()
+    activity.runOnUiThread {
+      activeNodeDialog?.dismiss()
+      dispatchPendingShortcut()
+    }
   }
 
   @Command
   fun createShortcut(invoke: Invoke) {
     val args = invoke.parseArgs(CreateShortcutArgs::class.java)
-    val nodeUri = Uri.parse(args.nodeOrigin)
-    val name = args.name.trim().take(40)
-    if (nodeUri.host.isNullOrEmpty() || !validId(args.moduleId) || name.isEmpty()) {
-      invoke.reject("Invalid shortcut")
-      return
-    }
-    if (!ShortcutManagerCompat.isRequestPinShortcutSupported(activity)) {
-      invoke.reject("Launcher does not support pinned shortcuts")
-      return
-    }
-    val shortcutIntent = Intent(activity, MainActivity::class.java).apply {
-      action = ACTION_OPEN_OFFLINE_MODULE
-      putExtra(EXTRA_NODE_ORIGIN, args.nodeOrigin)
-      putExtra(EXTRA_MODULE_ID, args.moduleId)
-      flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-    }
-    val shortcut = ShortcutInfoCompat.Builder(
-      activity,
-      "${args.nodeOrigin}:${args.moduleId}".hashCode().toUInt().toString(16),
+    val error = createPinnedShortcut(
+      args.nodeOrigin,
+      args.moduleId,
+      args.moduleTitle,
+      args.modulePath,
+      args.name,
+      args.iconText,
     )
-      .setShortLabel(name)
-      .setLongLabel("$name · ${nodeUri.host}")
-      .setIcon(IconCompat.createWithBitmap(shortcutIcon(args.moduleId)))
-      .setIntent(shortcutIntent)
-      .build()
-    if (ShortcutManagerCompat.requestPinShortcut(activity, shortcut, null)) {
+    if (error == null) {
       invoke.resolve()
     } else {
-      invoke.reject("Could not request pinned shortcut")
+      invoke.reject(error)
     }
   }
 
@@ -138,15 +144,21 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   fun takeShortcut(invoke: Invoke) {
     val nodeOrigin = pendingShortcutNode
     val moduleId = pendingShortcutModule
-    if (nodeOrigin == null || moduleId == null) {
+    val moduleTitle = pendingShortcutTitle
+    val modulePath = pendingShortcutPath
+    if (nodeOrigin == null || moduleId == null || moduleTitle == null || modulePath == null) {
       invoke.resolve()
       return
     }
     pendingShortcutNode = null
     pendingShortcutModule = null
+    pendingShortcutTitle = null
+    pendingShortcutPath = null
     invoke.resolve(app.tauri.plugin.JSObject().apply {
       put("nodeOrigin", nodeOrigin)
       put("moduleId", moduleId)
+      put("moduleTitle", moduleTitle)
+      put("modulePath", modulePath)
     })
   }
 
@@ -237,9 +249,12 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   fun open(invoke: Invoke) {
     val args = invoke.parseArgs(OpenNodeArgs::class.java)
     val nodeUri = Uri.parse(args.nodeUrl)
+    val sourceNodeUri = Uri.parse(args.nodeOrigin)
     if (
       (nodeUri.scheme != "https" && nodeUri.scheme != "http") ||
       nodeUri.host.isNullOrEmpty() ||
+      (sourceNodeUri.scheme != "https" && sourceNodeUri.scheme != "http") ||
+      sourceNodeUri.host.isNullOrEmpty() ||
       args.cookieName !in setOf("access_token", "netsanctum_offline") ||
       args.cookieValue.isEmpty() ||
       args.cookieValue.any { it == ';' || it == '\r' || it == '\n' }
@@ -249,11 +264,18 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     activity.runOnUiThread {
+      activeNodeDialog?.dismiss()
       val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_NoActionBar)
-      val container = FrameLayout(activity)
-      container.setBackgroundColor(Color.BLACK)
+      activeNodeDialog = dialog
+      val container = FrameLayout(activity).apply {
+        setBackgroundColor(Color.BLACK)
+      }
       val content = LinearLayout(activity).apply {
         orientation = LinearLayout.VERTICAL
+        setBackgroundColor(Color.BLACK)
+      }
+      val customViewContainer = FrameLayout(activity).apply {
+        visibility = View.GONE
         setBackgroundColor(Color.BLACK)
       }
       val toolbar = LinearLayout(activity).apply {
@@ -264,7 +286,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       }
       val webView = WebView(activity)
       webView.setBackgroundColor(Color.BLACK)
-      val homeButton = toolbarButton("NS")
+      val homeButton = toolbarButton("NC")
       val backButton = toolbarButton("<")
       val moduleButton = toolbarButton("MODULE").apply {
         maxLines = 1
@@ -299,22 +321,78 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         ViewGroup.LayoutParams.MATCH_PARENT,
       )
       container.addView(content, contentLayout)
+      container.addView(
+        customViewContainer,
+        FrameLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT,
+          ViewGroup.LayoutParams.MATCH_PARENT,
+        ),
+      )
+
+      var customView: View? = null
+      var customViewCallback: WebChromeClient.CustomViewCallback? = null
+      var isFullscreen = false
+
+      fun hideSystemBars() {
+        dialog.window?.let { window ->
+          val controller = WindowCompat.getInsetsController(window, window.decorView)
+          controller.hide(WindowInsetsCompat.Type.systemBars())
+          controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+      }
+
+      fun showSystemBars() {
+        dialog.window?.let { window ->
+          val controller = WindowCompat.getInsetsController(window, window.decorView)
+          controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+      }
+
       ViewCompat.setOnApplyWindowInsetsListener(container) { _, insets ->
         val safeInsets = insets.getInsets(
           WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
         )
-        contentLayout.setMargins(safeInsets.left, safeInsets.top, safeInsets.right, safeInsets.bottom)
+        if (isFullscreen) {
+          contentLayout.setMargins(0, 0, 0, 0)
+        } else {
+          contentLayout.setMargins(
+            safeInsets.left,
+            safeInsets.top,
+            safeInsets.right,
+            safeInsets.bottom,
+          )
+        }
         content.layoutParams = contentLayout
+        content.requestLayout()
         insets
       }
+
       homeButton.setOnClickListener { dialog.dismiss() }
       backButton.setOnClickListener {
-        if (webView.canGoBack()) webView.goBack() else dialog.dismiss()
+        if (customView != null) {
+          webView.webChromeClient?.onHideCustomView()
+        } else if (webView.canGoBack()) {
+          webView.goBack()
+        } else {
+          dialog.dismiss()
+        }
       }
-      settingsButton.setOnClickListener { showSettings(settingsButton, webView) }
+      settingsButton.setOnClickListener {
+        showSettings(
+          settingsButton,
+          webView,
+          sourceNodeUri,
+          args.moduleId,
+          args.moduleTitle,
+          args.modulePath,
+        )
+      }
+
       webView.settings.apply {
         javaScriptEnabled = true
         domStorageEnabled = true
+        mediaPlaybackRequiresUserGesture = false
         useWideViewPort = true
         loadWithOverviewMode = false
         textZoom = 100
@@ -327,10 +405,124 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       val preferences = activity.getSharedPreferences("netsanctum_ui", Activity.MODE_PRIVATE)
       webView.settings.textZoom = preferences.getInt("text_zoom", 100)
       webView.keepScreenOn = preferences.getBoolean("keep_screen_on", false)
+
+      webView.webChromeClient = object : WebChromeClient() {
+        override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+          if (customView != null) {
+            callback.onCustomViewHidden()
+            return
+          }
+          customView = view
+          customViewCallback = callback
+          isFullscreen = true
+
+          content.visibility = View.GONE
+          customViewContainer.visibility = View.VISIBLE
+          customViewContainer.removeAllViews()
+          customViewContainer.addView(
+            view,
+            FrameLayout.LayoutParams(
+              ViewGroup.LayoutParams.MATCH_PARENT,
+              ViewGroup.LayoutParams.MATCH_PARENT,
+              Gravity.CENTER,
+            ),
+          )
+          hideSystemBars()
+          ViewCompat.requestApplyInsets(container)
+        }
+
+        override fun onHideCustomView() {
+          if (customView == null) return
+          isFullscreen = false
+          customViewContainer.visibility = View.GONE
+          customViewContainer.removeAllViews()
+          content.visibility = View.VISIBLE
+
+          showSystemBars()
+
+          customViewCallback?.onCustomViewHidden()
+          customView = null
+          customViewCallback = null
+          ViewCompat.requestApplyInsets(container)
+        }
+
+        override fun getVideoLoadingProgressView(): View {
+          return ProgressBar(activity)
+        }
+
+        override fun onPermissionRequest(request: PermissionRequest) {
+          request.deny()
+        }
+
+        override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean {
+          AlertDialog.Builder(activity)
+            .setMessage(message)
+            .setPositiveButton("OK") { d, _ ->
+              d.dismiss()
+              result.confirm()
+            }
+            .setOnCancelListener { d ->
+              d.dismiss()
+              result.cancel()
+            }
+            .show()
+          return true
+        }
+
+        override fun onJsConfirm(view: WebView, url: String, message: String, result: JsResult): Boolean {
+          AlertDialog.Builder(activity)
+            .setMessage(message)
+            .setPositiveButton("OK") { d, _ ->
+              d.dismiss()
+              result.confirm()
+            }
+            .setNegativeButton("Отмена") { d, _ ->
+              d.dismiss()
+              result.cancel()
+            }
+            .setOnCancelListener { d ->
+              d.dismiss()
+              result.cancel()
+            }
+            .show()
+          return true
+        }
+
+        override fun onJsPrompt(
+          view: WebView,
+          url: String,
+          message: String,
+          defaultValue: String,
+          result: JsPromptResult,
+        ): Boolean {
+          val input = EditText(activity).apply {
+            setText(defaultValue)
+          }
+          AlertDialog.Builder(activity)
+            .setMessage(message)
+            .setView(input)
+            .setPositiveButton("OK") { d, _ ->
+              d.dismiss()
+              result.confirm(input.text.toString())
+            }
+            .setNegativeButton("Отмена") { d, _ ->
+              d.dismiss()
+              result.cancel()
+            }
+            .setOnCancelListener { d ->
+              d.dismiss()
+              result.cancel()
+            }
+            .show()
+          return true
+        }
+      }
+
       webView.webViewClient = object : WebViewClient() {
-        override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
           super.onPageStarted(view, url, favicon)
-          loading.visibility = android.view.View.VISIBLE
+          loading.visibility = View.VISIBLE
+          installBackgroundMediaBridge(view)
         }
 
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -345,7 +537,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
         override fun onPageFinished(view: WebView, url: String) {
           super.onPageFinished(view, url)
-          loading.visibility = android.view.View.GONE
+          loading.visibility = View.GONE
+          installBackgroundMediaBridge(view)
           if (
             args.cookieName == "access_token" &&
             sameOrigin(nodeUri, Uri.parse(url))
@@ -359,7 +552,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
             installOfflineStyles(view)
             moduleButton.text = "OFFLINE"
             moduleButton.isEnabled = false
-            languageButton.visibility = android.view.View.GONE
+            languageButton.visibility = View.GONE
           }
         }
 
@@ -373,7 +566,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
             val message = TextUtils.htmlEncode("Не удалось открыть узел: ${error.description}")
             view.loadDataWithBaseURL(
               null,
-              "<html><body style='margin:0;padding:32px;background:#0a0d0b;color:#e9eee8;font-family:monospace'><h2>NetSanctum</h2><p>$message</p></body></html>",
+              "<html><body style='margin:0;padding:32px;background:#0a0d0b;color:#e9eee8;font-family:monospace'><h2>Netsanctum Client</h2><p>$message</p></body></html>",
               "text/html",
               "UTF-8",
               null,
@@ -396,6 +589,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       dialog.setOnKeyListener { _, keyCode, event ->
         if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
           false
+        } else if (customView != null) {
+          webView.webChromeClient?.onHideCustomView()
+          true
         } else if (webView.canGoBack()) {
           webView.goBack()
           true
@@ -405,9 +601,13 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         }
       }
       dialog.setOnDismissListener {
+        if (customView != null) {
+          webView.webChromeClient?.onHideCustomView()
+        }
         cookies.setCookie(args.nodeUrl, "${args.cookieName}=; Path=/; Max-Age=0$secure")
         webView.stopLoading()
         webView.destroy()
+        if (activeNodeDialog === dialog) activeNodeDialog = null
       }
       dialog.show()
       dialog.window?.let { window ->
@@ -416,6 +616,11 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           ViewGroup.LayoutParams.MATCH_PARENT,
           ViewGroup.LayoutParams.MATCH_PARENT,
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+          window.attributes.layoutInDisplayCutoutMode =
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
       }
       ViewCompat.requestApplyInsets(container)
       webView.loadUrl(args.nodeUrl)
@@ -423,12 +628,35 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolve()
   }
 
+  private fun installBackgroundMediaBridge(webView: WebView) {
+    val script = """
+      (() => {
+        if (window.__NETSANCTUM_BG_MEDIA_INSTALLED__) return;
+        window.__NETSANCTUM_BG_MEDIA_INSTALLED__ = true;
+        try {
+          Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+          Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+          Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+          Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+        } catch (_) {}
+
+        window.addEventListener('visibilitychange', (e) => {
+          e.stopImmediatePropagation();
+        }, true);
+        document.addEventListener('visibilitychange', (e) => {
+          e.stopImmediatePropagation();
+        }, true);
+      })();
+    """.trimIndent()
+    webView.evaluateJavascript(script, null)
+  }
+
   private fun installDownloadBridge(webView: WebView, nodeUri: Uri) {
     val origin = "${nodeUri.scheme}://${nodeUri.encodedAuthority}"
     val script = """
       (() => {
-        if (location.origin !== ${org.json.JSONObject.quote(origin)} || window.__NETSANCTUM_DESKTOP__) return;
-        Object.defineProperty(window, "__NETSANCTUM_DESKTOP__", {
+        if (location.origin !== ${org.json.JSONObject.quote(origin)} || window.__NETSANCTUM_CLIENT__) return;
+        Object.defineProperty(window, "__NETSANCTUM_CLIENT__", {
           value: Object.freeze({
             version: 1,
             requestDownload(manifestUrl) {
@@ -442,6 +670,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           configurable: false,
           writable: false
         });
+        window.__NETSANCTUM_DESKTOP__ = window.__NETSANCTUM_CLIENT__;
         document.documentElement.classList.add("has-outpost-bridge");
         document.querySelector('body > nav')?.style.setProperty('display', 'none', 'important');
       })();
@@ -458,7 +687,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           viewport.name = 'viewport';
           document.head.appendChild(viewport);
         }
-        viewport.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no';
+        viewport.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
         document.querySelector('body > nav')?.style.setProperty('display', 'none', 'important');
         if (document.getElementById('netsanctum-mobile-offline')) return;
         const style = document.createElement('style');
@@ -474,6 +703,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           .custom-controls { padding: 0.5rem !important; }
           .custom-controls .gap-4 { gap: 0.5rem !important; }
           .settings-menu-container, .vol-slider { display: none !important; }
+          :fullscreen, :-webkit-full-screen { width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; padding: 0 !important; background: #000 !important; }
+          :fullscreen video, :-webkit-full-screen video { width: 100% !important; height: 100% !important; max-width: 100vw !important; max-height: 100vh !important; object-fit: contain !important; }
         `;
         document.head.appendChild(style);
       })();
@@ -550,13 +781,26 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     webView.evaluateJavascript(script, null)
   }
 
-  private fun showSettings(anchor: Button, webView: WebView) {
+  private fun showSettings(
+    anchor: Button,
+    webView: WebView,
+    nodeUri: Uri,
+    moduleId: String,
+    moduleTitle: String,
+    modulePath: String,
+  ) {
     val preferences = activity.getSharedPreferences("netsanctum_ui", Activity.MODE_PRIVATE)
     val scales = listOf(90, 100, 115, 130)
     val currentScale = preferences.getInt("text_zoom", 100)
     val keepScreenOn = preferences.getBoolean("keep_screen_on", false)
+    val backgroundMedia = preferences.getBoolean("background_media", true)
     val choices = scales.map { "ТЕКСТ $it%" } +
-      listOf("ЭКРАН: ${if (keepScreenOn) "НЕ ГАСИТЬ" else "ОБЫЧНО"}", "ОЧИСТИТЬ WEB-КЭШ")
+      listOf(
+        "ЭКРАН: ${if (keepScreenOn) "НЕ ГАСИТЬ" else "ОБЫЧНО"}",
+        "ФОНОВОЕ АУДИО: ${if (backgroundMedia) "ВКЛ" else "ВЫКЛ"}",
+        "ДОБАВИТЬ ЯРЛЫК",
+        "ОЧИСТИТЬ WEB-КЭШ",
+      )
     showChoicePopup(anchor, choices, scales.indexOf(currentScale)) { index ->
       when {
         index < scales.size -> {
@@ -569,9 +813,130 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           preferences.edit().putBoolean("keep_screen_on", enabled).apply()
           webView.keepScreenOn = enabled
         }
+        index == scales.size + 1 -> {
+          val enabled = !backgroundMedia
+          preferences.edit().putBoolean("background_media", enabled).apply()
+        }
+        index == scales.size + 2 ->
+          showShortcutDialog(webView, nodeUri, moduleId, moduleTitle, modulePath)
         else -> webView.clearCache(true)
       }
     }
+  }
+
+  private fun showShortcutDialog(
+    webView: WebView,
+    nodeUri: Uri,
+    knownModuleId: String,
+    knownModuleTitle: String,
+    knownModulePath: String,
+  ) {
+    if (
+      knownModuleTitle.isNotEmpty() &&
+      validRelativeUrl(knownModulePath) &&
+      (knownModuleId.isEmpty() || validId(knownModuleId))
+    ) {
+      showShortcutFields(nodeUri, knownModuleId, knownModuleTitle, knownModulePath)
+      return
+    }
+    val script = """
+      (() => {
+        const selects = [...document.querySelectorAll('body > nav select')];
+        const language = document.querySelector('body > nav select[name="lang"]');
+        const select = selects.find(item => item !== language && [...item.options].some(option => option.value.startsWith('/')));
+        if (!select) return null;
+        const options = [...select.options].filter(option => option.value.startsWith('/') && !option.value.startsWith('/set-language'));
+        const current = select.selectedOptions[0] || options
+          .filter(option => location.pathname.startsWith(new URL(option.value, location.href).pathname))
+          .sort((left, right) => right.value.length - left.value.length)[0];
+        if (!current) return null;
+        const explicitId = current.dataset.moduleId
+          || document.querySelector('meta[name="netsanctum-module-id"]')?.content
+          || document.documentElement.dataset.moduleId
+          || document.body?.dataset.moduleId
+          || '';
+        return JSON.stringify({
+          id: explicitId,
+          title: current.textContent.trim(),
+          path: current.value
+        });
+      })();
+    """.trimIndent()
+    webView.evaluateJavascript(script) { raw ->
+      activity.runOnUiThread {
+        try {
+          val encoded = org.json.JSONTokener(raw).nextValue() as? String
+          val module = encoded?.let { org.json.JSONObject(it) }
+          val moduleId = module?.optString("id", "")?.trim().orEmpty()
+          val moduleTitle = module?.optString("title", "")?.trim().orEmpty()
+          val modulePath = module?.optString("path", "")?.trim().orEmpty()
+          if (
+            moduleTitle.isEmpty() ||
+            !validRelativeUrl(modulePath) ||
+            (moduleId.isNotEmpty() && !validId(moduleId))
+          ) {
+            Toast.makeText(activity, "Не удалось определить активный модуль", Toast.LENGTH_SHORT).show()
+            return@runOnUiThread
+          }
+
+          showShortcutFields(nodeUri, moduleId, moduleTitle, modulePath)
+        } catch (_: Exception) {
+          Toast.makeText(activity, "Не удалось определить активный модуль", Toast.LENGTH_SHORT).show()
+        }
+      }
+    }
+  }
+
+  private fun showShortcutFields(
+    nodeUri: Uri,
+    moduleId: String,
+    moduleTitle: String,
+    modulePath: String,
+  ) {
+    val fields = LinearLayout(activity).apply {
+      orientation = LinearLayout.VERTICAL
+      setPadding(dp(20), dp(8), dp(20), 0)
+    }
+    val nameInput = EditText(activity).apply {
+      hint = "Название ярлыка"
+      setText("$moduleTitle · ${nodeUri.host}")
+      setSelectAllOnFocus(true)
+      maxLines = 1
+    }
+    val iconInput = EditText(activity).apply {
+      hint = "Значок (1–2 символа)"
+      setText(defaultIconText(moduleTitle))
+      setSelectAllOnFocus(true)
+      maxLines = 1
+    }
+    fields.addView(nameInput)
+    fields.addView(iconInput)
+    val dialog = AlertDialog.Builder(activity)
+      .setTitle("Умный ярлык")
+      .setMessage("Ярлык откроет «$moduleTitle» онлайн или предложит доступную офлайн-версию.")
+      .setView(fields)
+      .setNegativeButton("Отмена", null)
+      .setPositiveButton("Добавить", null)
+      .create()
+    dialog.setOnShowListener {
+      dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+        val error = createPinnedShortcut(
+          nodeUri.toString().trimEnd('/'),
+          moduleId,
+          moduleTitle,
+          modulePath,
+          nameInput.text.toString(),
+          iconInput.text.toString(),
+        )
+        if (error == null) {
+          Toast.makeText(activity, "Запрос на добавление ярлыка отправлен", Toast.LENGTH_SHORT).show()
+          dialog.dismiss()
+        } else {
+          Toast.makeText(activity, error, Toast.LENGTH_LONG).show()
+        }
+      }
+    }
+    dialog.show()
   }
 
   private fun showChoicePopup(
@@ -625,6 +990,65 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     setPadding(dp(10), 0, dp(10), 0)
   }
 
+  private fun createPinnedShortcut(
+    nodeOrigin: String,
+    moduleId: String,
+    moduleTitle: String,
+    modulePath: String,
+    requestedName: String,
+    requestedIconText: String,
+  ): String? {
+    val nodeUri = Uri.parse(nodeOrigin)
+    val name = requestedName.trim().take(40)
+    val iconText = requestedIconText.trim().take(2).uppercase()
+    if (
+      (nodeUri.scheme != "https" && nodeUri.scheme != "http") ||
+      nodeUri.host.isNullOrEmpty() ||
+      (moduleId.isNotEmpty() && !validId(moduleId)) ||
+      moduleTitle.trim().isEmpty() ||
+      moduleTitle.length > 256 ||
+      !validRelativeUrl(modulePath) ||
+      name.isEmpty() ||
+      iconText.isEmpty() ||
+      !iconText.all { it.isLetterOrDigit() }
+    ) {
+      return "Некорректные параметры ярлыка"
+    }
+    if (!ShortcutManagerCompat.isRequestPinShortcutSupported(activity)) {
+      return "Launcher не поддерживает ярлыки"
+    }
+    val normalizedOrigin = nodeOrigin.trimEnd('/')
+    val shortcutIntent = Intent(activity, MainActivity::class.java).apply {
+      action = ACTION_OPEN_SMART_MODULE
+      putExtra(EXTRA_NODE_ORIGIN, normalizedOrigin)
+      putExtra(EXTRA_MODULE_ID, moduleId)
+      putExtra(EXTRA_MODULE_TITLE, moduleTitle.trim())
+      putExtra(EXTRA_MODULE_PATH, modulePath)
+      flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+    }
+    val shortcutKey = if (moduleId.isNotEmpty()) moduleId else modulePath
+    val shortcut = ShortcutInfoCompat.Builder(
+      activity,
+      "$normalizedOrigin:$shortcutKey".hashCode().toUInt().toString(16),
+    )
+      .setShortLabel(name)
+      .setLongLabel("$name · ${nodeUri.host}")
+      .setIcon(IconCompat.createWithBitmap(shortcutIcon(iconText)))
+      .setIntent(shortcutIntent)
+      .build()
+    return if (ShortcutManagerCompat.requestPinShortcut(activity, shortcut, null)) {
+      null
+    } else {
+      "Не удалось добавить ярлык"
+    }
+  }
+
+  private fun defaultIconText(title: String): String {
+    val words = title.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    return words.mapNotNull { it.firstOrNull() }.take(2).joinToString("").uppercase()
+      .ifEmpty { "NC" }
+  }
+
   private fun validRelativeUrl(value: String): Boolean {
     val uri = Uri.parse(value)
     return value.length <= 4096 &&
@@ -641,29 +1065,40 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
   private fun captureShortcut(intent: Intent) {
-    if (intent.action != ACTION_OPEN_OFFLINE_MODULE) return
+    if (intent.action != ACTION_OPEN_SMART_MODULE && intent.action != LEGACY_ACTION_OPEN_OFFLINE_MODULE) return
     val nodeOrigin = intent.getStringExtra(EXTRA_NODE_ORIGIN) ?: return
     val moduleId = intent.getStringExtra(EXTRA_MODULE_ID) ?: return
+    val moduleTitle = intent.getStringExtra(EXTRA_MODULE_TITLE) ?: moduleId
+    val modulePath = intent.getStringExtra(EXTRA_MODULE_PATH) ?: ""
     val nodeUri = Uri.parse(nodeOrigin)
     if (
       (nodeUri.scheme != "https" && nodeUri.scheme != "http") ||
       nodeUri.host.isNullOrEmpty() ||
-      !validId(moduleId)
+      (moduleId.isNotEmpty() && !validId(moduleId)) ||
+      (modulePath.isNotEmpty() && !validRelativeUrl(modulePath))
     ) return
     pendingShortcutNode = nodeOrigin
     pendingShortcutModule = moduleId
+    pendingShortcutTitle = moduleTitle
+    pendingShortcutPath = modulePath
     intent.action = null
   }
 
   private fun dispatchPendingShortcut() {
     val nodeOrigin = pendingShortcutNode ?: return
     val moduleId = pendingShortcutModule ?: return
+    val moduleTitle = pendingShortcutTitle ?: return
+    val modulePath = pendingShortcutPath ?: return
     val payload = org.json.JSONObject().apply {
       put("nodeOrigin", nodeOrigin)
       put("moduleId", moduleId)
+      put("moduleTitle", moduleTitle)
+      put("modulePath", modulePath)
     }
     pendingShortcutNode = null
     pendingShortcutModule = null
+    pendingShortcutTitle = null
+    pendingShortcutPath = null
     shellWebView?.post {
       shellWebView?.evaluateJavascript(
         "window.dispatchEvent(new CustomEvent('netsanctum-open-shortcut',{detail:$payload}))",
@@ -672,7 +1107,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  private fun shortcutIcon(moduleId: String): Bitmap {
+  private fun shortcutIcon(iconText: String): Bitmap {
     val size = 192
     val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
@@ -687,8 +1122,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     paint.textAlign = Paint.Align.CENTER
     paint.textSize = 58f
-    val initials = moduleId.split('_', '-').mapNotNull { it.firstOrNull() }.take(2)
-      .joinToString("").uppercase().ifEmpty { "NS" }
+    val initials = iconText.take(2).uppercase().ifEmpty { "NC" }
     val baseline = size / 2f - (paint.ascent() + paint.descent()) / 2f
     canvas.drawText(initials, size / 2f, baseline, paint)
     return bitmap
@@ -769,7 +1203,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
     val channel = NotificationChannel(
       DOWNLOAD_CHANNEL,
-      "Загрузки NetSanctum",
+      "Загрузки Netsanctum Client",
       NotificationManager.IMPORTANCE_LOW,
     )
     activity.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -779,9 +1213,12 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     private const val DOWNLOAD_CHANNEL = "netsanctum_downloads"
     private const val DOWNLOAD_NOTIFICATION_ID = 4101
     private const val NOTIFICATION_PERMISSION_REQUEST = 4102
-    private const val ACTION_OPEN_OFFLINE_MODULE = "dev.netsanctum.desktop.OPEN_OFFLINE_MODULE"
+    private const val ACTION_OPEN_SMART_MODULE = "dev.netsanctum.desktop.OPEN_SMART_MODULE"
+    private const val LEGACY_ACTION_OPEN_OFFLINE_MODULE = "dev.netsanctum.desktop.OPEN_OFFLINE_MODULE"
     private const val EXTRA_NODE_ORIGIN = "node_origin"
     private const val EXTRA_MODULE_ID = "module_id"
+    private const val EXTRA_MODULE_TITLE = "module_title"
+    private const val EXTRA_MODULE_PATH = "module_path"
     private const val VAULT_PREFS = "netsanctum_vault_key"
     private const val VAULT_KEY_ALIAS = "netsanctum_vault_key_v1"
   }

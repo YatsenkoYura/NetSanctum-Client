@@ -15,12 +15,17 @@
     isMobile,
     navigateBack,
     openNode,
+    openNodeModule,
+    openOffline,
     openOfflineModule,
     resetConnection,
     showHome,
+    shortcutOnlineAvailable,
     takeMobileShortcut,
+    unlockShortcut,
     unlockVault,
     type ConnectionState,
+    type ModuleShortcutTarget,
     type SavedModule,
   } from "./lib/api";
 
@@ -48,6 +53,11 @@
   let libraryManagerOpen = false;
   let deletingPackage = "";
   let downloadStatus: { status: string; progress: number; message: string } | null = null;
+  let shortcutTarget: ModuleShortcutTarget | null = null;
+  let shortcutMode: "unlock" | "offline" = "offline";
+  let shortcutPassword = "";
+  let shortcutError = "";
+  let shortcutBusy = false;
   const appWindow = getCurrentWindow();
 
   const labels: Record<ConnectionState["status"], string> = {
@@ -68,7 +78,7 @@
       mobile = mobilePlatform;
       if (mobilePlatform) {
         const shortcut = await takeMobileShortcut();
-        if (shortcut) await showOfflineModule(shortcut.nodeOrigin, shortcut.moduleId);
+        if (shortcut) await handleSmartShortcut(shortcut);
       }
     } catch (cause) {
       error = describeError(cause);
@@ -110,9 +120,14 @@
     };
     window.addEventListener("netsanctum-download-request", handleDownloadRequest);
     const handleShortcut = (event: Event) => {
-      const target = (event as CustomEvent<{ nodeOrigin?: unknown; moduleId?: unknown }>).detail;
-      if (typeof target?.nodeOrigin === "string" && typeof target?.moduleId === "string") {
-        void showOfflineModule(target.nodeOrigin, target.moduleId);
+      const target = (event as CustomEvent<Partial<ModuleShortcutTarget>>).detail;
+      if (
+        typeof target?.nodeOrigin === "string" &&
+        typeof target?.moduleId === "string" &&
+        typeof target?.moduleTitle === "string" &&
+        typeof target?.modulePath === "string"
+      ) {
+        void handleSmartShortcut(target as ModuleShortcutTarget);
       }
     };
     window.addEventListener("netsanctum-open-shortcut", handleShortcut);
@@ -269,10 +284,141 @@
     const name = prompt("Название ярлыка", `${module.module_title} · ${host}`)?.trim();
     if (!name) return;
     try {
-      await createModuleShortcut(module.node_origin, module.module_id, name);
+      await createModuleShortcut(
+        module.node_origin,
+        module.module_id,
+        module.module_title,
+        module.module_root_url,
+        name,
+        defaultIconText(module.module_title),
+      );
     } catch (cause) {
       error = describeError(cause);
     }
+  }
+
+  function defaultIconText(title: string): string {
+    return title
+      .trim()
+      .split(/\s+/)
+      .map((word) => word[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase() || "NC";
+  }
+
+  function normalizedNode(value: string | null): string {
+    if (!value) return "";
+    try {
+      const url = new URL(value);
+      const path = url.pathname.replace(/\/+$/, "");
+      return `${url.origin}${path}`;
+    } catch {
+      return "";
+    }
+  }
+
+  function shortcutMatchesConnection(target: ModuleShortcutTarget): boolean {
+    return normalizedNode(target.nodeOrigin) === normalizedNode(connection.node_url);
+  }
+
+  async function handleSmartShortcut(target: ModuleShortcutTarget) {
+    shortcutTarget = target;
+    shortcutPassword = "";
+    shortcutError = "";
+    if (!target.modulePath) {
+      shortcutMode = "offline";
+      return;
+    }
+    if (shortcutMatchesConnection(target) && connection.status === "connected") {
+      try {
+        if (await shortcutOnlineAvailable(target.nodeOrigin)) {
+          await openShortcutOnline(target);
+          closeShortcut();
+          return;
+        }
+        shortcutError = "Сохранённая online-сессия больше не действует.";
+      } catch (cause) {
+        shortcutError = `Онлайн-версия недоступна: ${describeError(cause)}`;
+      }
+    }
+    shortcutMode = shortcutMatchesConnection(target) && connection.status === "vault_locked"
+      ? "unlock"
+      : "offline";
+  }
+
+  async function openShortcutOnline(target: ModuleShortcutTarget) {
+    if (target.modulePath) {
+      await openNodeModule(target.modulePath);
+    } else {
+      await openNode();
+    }
+  }
+
+  async function unlockShortcutTarget() {
+    if (!shortcutTarget) return;
+    shortcutBusy = true;
+    shortcutError = "";
+    try {
+      connection = await unlockShortcut(shortcutPassword);
+      shortcutPassword = "";
+      if (connection.status === "connected" && shortcutMatchesConnection(shortcutTarget)) {
+        await openShortcutOnline(shortcutTarget);
+        closeShortcut();
+      } else {
+        shortcutMode = "offline";
+        shortcutError = connection.message || "Исходный узел сейчас недоступен.";
+      }
+    } catch (cause) {
+      shortcutError = describeError(cause);
+    } finally {
+      shortcutPassword = "";
+      shortcutBusy = false;
+    }
+  }
+
+  function offlineShortcutPackages(target: ModuleShortcutTarget) {
+    return modules
+      .filter((module) =>
+        (target.moduleId && module.module_id === target.moduleId) ||
+        (target.modulePath && module.module_root_url === target.modulePath),
+      )
+      .flatMap((module) =>
+        module.packages
+          .filter((item) => item.status === "ready")
+          .map((item) => ({ module, item })),
+      )
+      .sort((left, right) => {
+        const leftSource = normalizedNode(left.module.node_origin) === normalizedNode(target.nodeOrigin) ? 1 : 0;
+        const rightSource = normalizedNode(right.module.node_origin) === normalizedNode(target.nodeOrigin) ? 1 : 0;
+        return rightSource - leftSource || Number(right.item.saved_at) - Number(left.item.saved_at);
+      });
+  }
+
+  async function openShortcutOffline(nodeOrigin: string, packageId: string) {
+    shortcutBusy = true;
+    shortcutError = "";
+    try {
+      await openOffline(nodeOrigin, packageId);
+      closeShortcut();
+    } catch (cause) {
+      shortcutError = describeError(cause);
+    } finally {
+      shortcutBusy = false;
+    }
+  }
+
+  function formatSavedAt(value: string): string {
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp)) return value;
+    return new Date(timestamp * 1000).toLocaleString();
+  }
+
+  function closeShortcut() {
+    shortcutTarget = null;
+    shortcutPassword = "";
+    shortcutError = "";
+    shortcutBusy = false;
   }
 
   function describeError(cause: unknown): string {
@@ -288,15 +434,15 @@
 </script>
 
 <svelte:head>
-  <title>NetSanctum Desktop</title>
+  <title>Netsanctum Client</title>
 </svelte:head>
 
 {#if !mobile}
 <div class="window-titlebar" data-tauri-drag-region role="toolbar" aria-label="Управление окном">
   <div class="titlebar-nav">
     <button type="button" title="Назад" aria-label="Назад" on:click={() => navigateBack()}>←</button>
-    <button type="button" title="Desktop Home" aria-label="Desktop Home" on:click={() => showHome()}>NS</button>
-    <span class="titlebar-product">NETSANCTUM</span>
+    <button type="button" title="Client Home" aria-label="Client Home" on:click={() => showHome()}>NC</button>
+    <span class="titlebar-product">NETSANCTUM CLIENT</span>
   </div>
   <div class="titlebar-modules" data-tauri-drag-region></div>
   <div class="window-controls">
@@ -309,10 +455,10 @@
 
 <main class:mobile class="app-shell">
   <header class="topbar">
-    <div class="brand-mark" aria-hidden="true">NS</div>
+    <div class="brand-mark" aria-hidden="true">NC</div>
     <div>
       <p class="eyebrow">PRIVATE OUTPOST</p>
-      <h1>NetSanctum <span>Desktop</span></h1>
+      <h1>Netsanctum <span>Client</span></h1>
     </div>
     <div class="topbar-status" data-status={connection.status}>
       <span class="status-light"></span>
@@ -561,6 +707,82 @@
     </div>
   {/if}
 </main>
+
+{#if shortcutTarget}
+  {@const shortcutPackages = offlineShortcutPackages(shortcutTarget)}
+  <div class="shortcut-overlay" role="dialog" aria-modal="true" aria-labelledby="shortcut-title">
+    <section class="shortcut-panel">
+      <header>
+        <div>
+          <p class="eyebrow">SMART SHORTCUT</p>
+          <h2 id="shortcut-title">{shortcutTarget.moduleTitle || shortcutTarget.moduleId}</h2>
+          <small>{new URL(shortcutTarget.nodeOrigin).host}</small>
+        </div>
+        <button type="button" on:click={closeShortcut}>ЗАКРЫТЬ</button>
+      </header>
+
+      {#if shortcutMode === "unlock"}
+        <form on:submit|preventDefault={unlockShortcutTarget} autocomplete="off">
+          <p>Для онлайн-входа в исходный узел разблокируйте сохранённый мастер-токен.</p>
+          <label for="shortcut-vault-password">Пароль локального хранилища</label>
+          <input
+            id="shortcut-vault-password"
+            bind:value={shortcutPassword}
+            type="password"
+            required
+            disabled={shortcutBusy}
+            autocomplete="off"
+          />
+          {#if shortcutError}
+            <div class="error-message" role="alert">{shortcutError}</div>
+          {/if}
+          <button class="primary-button" type="submit" disabled={shortcutBusy}>
+            {shortcutBusy ? "ПРОВЕРКА УЗЛА…" : "ОТКРЫТЬ ОНЛАЙН"}
+          </button>
+          <button class="secondary-button" type="button" on:click={() => (shortcutMode = "offline")}>
+            ВЫБРАТЬ ОФЛАЙН-ВЕРСИЮ
+          </button>
+        </form>
+      {:else}
+        <p class="shortcut-explanation">
+          Доступной online-сессии для исходного узла нет. Выберите сохранённую версию этого модуля.
+        </p>
+        {#if shortcutError}
+          <div class="error-message" role="alert">{shortcutError}</div>
+        {/if}
+        {#if shortcutPackages.length === 0}
+          <div class="shortcut-empty">
+            На устройстве нет готовых офлайн-версий этого модуля.
+          </div>
+        {:else}
+          <div class="shortcut-options">
+            {#each shortcutPackages as candidate}
+              <button
+                type="button"
+                disabled={shortcutBusy}
+                on:click={() => openShortcutOffline(candidate.module.node_origin, candidate.item.package_id)}
+              >
+                <span>
+                  <strong>{candidate.item.package_title}</strong>
+                  <small>{candidate.module.module_title} · {new URL(candidate.module.node_origin).host}</small>
+                </span>
+                <span>
+                  <strong>{formatSize(candidate.item.byte_size)}</strong>
+                  <small>{formatSavedAt(candidate.item.saved_at)}</small>
+                </span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        {#if shortcutMatchesConnection(shortcutTarget) && connection.status === "vault_locked"}
+          <button class="secondary-button" type="button" on:click={() => (shortcutMode = "unlock")}>
+            ПОПРОБОВАТЬ ОНЛАЙН
+          </button>
+        {/if}
+      {/if}
+    </section>
+  </div>
+{/if}
 
 {#if libraryManagerOpen}
   <div class="library-manager" role="dialog" aria-modal="true" aria-labelledby="library-manager-title">

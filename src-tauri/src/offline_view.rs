@@ -77,6 +77,7 @@ async fn open_access(app: &AppHandle, root_url: String, access: OfflineAccess) -
             #netsanctum-desktop-chrome .nsd-controls { display:flex }
             #netsanctum-desktop-chrome .nsd-controls button { border-right:0;border-left:1px solid #162825 }
             #netsanctum-desktop-chrome .nsd-close:hover { color:#fb7185;background:#211011 }
+            :fullscreen #netsanctum-desktop-chrome, :-webkit-full-screen #netsanctum-desktop-chrome, :fullscreen ~ #netsanctum-desktop-chrome { display:none !important }
           `;
           document.head.appendChild(style);
           const chrome = document.createElement("div");
@@ -92,7 +93,7 @@ async fn open_access(app: &AppHandle, root_url: String, access: OfflineAccess) -
             return element;
           };
           chrome.append(button("←", "Назад", () => action("back")));
-          chrome.append(button("NS", "Desktop Home", () => action("home")));
+          chrome.append(button("NC", "Client Home", () => action("home")));
           const label = document.createElement("div");
           label.className = "nsd-label";
           label.textContent = "OFFLINE PACKAGE";

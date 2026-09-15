@@ -138,7 +138,7 @@ pub fn install_tray(app: &App) -> tauri::Result<()> {
         .clone();
     TrayIconBuilder::new()
         .icon(icon)
-        .tooltip("NetSanctum Desktop")
+        .tooltip("Netsanctum Client")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {

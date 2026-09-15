@@ -8,20 +8,27 @@ use reqwest::{
     header::{COOKIE, HeaderMap, SET_COOKIE},
     redirect::Policy,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(not(mobile))]
+use serde::Serialize;
 use url::Url;
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(not(mobile))]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::{AppError, AppResult};
 
+#[cfg(not(mobile))]
 const MAX_AUTH_RESPONSE_BYTES: u64 = 64 * 1024;
 
+#[cfg(not(mobile))]
 #[derive(Debug, Serialize)]
 struct SessionRequest<'a> {
     master_token: &'a str,
     client: ClientIdentity<'a>,
 }
 
+#[cfg(not(mobile))]
 #[derive(Debug, Serialize)]
 struct ClientIdentity<'a> {
     name: &'a str,
@@ -29,6 +36,7 @@ struct ClientIdentity<'a> {
     protocol_version: u8,
 }
 
+#[cfg(not(mobile))]
 #[derive(Debug, Deserialize)]
 struct SessionResponse {
     access_token: String,
@@ -94,7 +102,7 @@ impl NodeClient {
         let builder = Client::builder()
             .redirect(Policy::none())
             .https_only(false)
-            .user_agent(concat!("NetSanctumDesktop/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("NetsanctumClient/", env!("CARGO_PKG_VERSION")));
         #[cfg(target_os = "android")]
         let builder = {
             let mut roots = rustls::RootCertStore::empty();
@@ -188,6 +196,39 @@ impl NodeClient {
             .map_err(|error| AppError::Download(safe_network_error(&error)))
     }
 
+    pub async fn check_authenticated(
+        &self,
+        node_url: &Url,
+        credential: &SessionCredential,
+    ) -> AppResult<bool> {
+        let url = node_url
+            .join("auth/me")
+            .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
+        let request = self.client.get(url).header("Accept", "application/json");
+        let request = match credential {
+            SessionCredential::Bearer(token) => request.bearer_auth(token.as_str()),
+            SessionCredential::Cookie(session_id) => {
+                request.header(COOKIE, format!("access_token={}", session_id.as_str()))
+            }
+        };
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::NodeUnavailable(safe_network_error(&error)))?;
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::FORBIDDEN
+        {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(AppError::NodeUnavailable(format!(
+                "проверка сессии вернула HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(true)
+    }
+
     #[cfg(not(mobile))]
     pub async fn create_session(
         &self,
@@ -204,7 +245,7 @@ impl NodeClient {
             .json(&SessionRequest {
                 master_token,
                 client: ClientIdentity {
-                    name: "NetSanctum Desktop",
+                    name: "Netsanctum Client",
                     version: env!("CARGO_PKG_VERSION"),
                     protocol_version: 1,
                 },

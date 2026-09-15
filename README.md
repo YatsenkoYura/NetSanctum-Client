@@ -1,11 +1,11 @@
-# NetSanctum Desktop
+# Netsanctum Client
 
-Native desktop and offline client for [NetSanctum](https://github.com/YatsenkoYura/NetSanctum).
+Native desktop and mobile client for [NetSanctum](https://github.com/YatsenkoYura/NetSanctum).
 
-NetSanctum Desktop connects to an existing node. It does not run Docker, PostgreSQL, Redis, Celery, or module Python code on the user's computer. Online modules are rendered in a sandboxed WebView; selected module packages can be downloaded and opened through the local offline runtime.
+Netsanctum Client connects to an existing node. It does not run Docker, PostgreSQL, Redis, Celery, or module Python code on the user's computer. Online modules are rendered in a sandboxed WebView; selected module packages can be downloaded and opened through the local offline runtime.
 
 > [!WARNING]
-> NetSanctum Desktop 2.0 unifies the desktop and Android clients in one release line. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
+> Netsanctum Client 2.0 unifies the desktop and Android clients in one release line. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
 
 ## Features
 
@@ -35,7 +35,7 @@ Early releases are not code-signed. Windows may show an Unknown Publisher/SmartS
 
 ### Arch Linux repository
 
-NetSanctum Desktop publishes an unsigned pacman repository generated from the official Debian release package. Add this block to `/etc/pacman.conf`:
+Netsanctum Client publishes an unsigned pacman repository generated from the official Debian release package. Add this block to `/etc/pacman.conf`:
 
 ```ini
 [netsanctum]
@@ -58,7 +58,7 @@ Future versions are installed by the usual `sudo pacman -Syu`. The repository is
 3. Create a local vault password of at least 10 characters.
 4. Re-enter the vault password after each application restart.
 5. Open a supported item on the node and use **Save to device**.
-6. Return to Desktop Home and open the saved module from the local archive.
+6. Return to Client Home and open the saved module from the local archive.
 
 The vault password is never persisted. Losing it requires reconnecting the node; it does not alter server data.
 
@@ -161,11 +161,11 @@ pre-commit install
 All version sources are kept in sync by `scripts/version.mjs`.
 
 ```bash
-npm run version:set -- 2.0.0
+npm run version:set -- 2.0.1
 npm run version:check
-git commit -am "chore(release): prepare v2.0.0"
-git tag -a v2.0.0 -m "NetSanctum Desktop v2.0.0"
-git push origin main v2.0.0
+git commit -am "chore(release): prepare v2.0.1"
+git tag -a v2.0.1 -m "Netsanctum Client v2.0.1"
+git push origin main v2.0.1
 ```
 
 The tag must exactly match the version in `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`. GitHub Actions builds every installer into a draft and publishes the release only after all jobs succeed.

@@ -15,6 +15,10 @@ struct MobileNodePlugin<R: Runtime>(PluginHandle<R>);
 #[serde(rename_all = "camelCase")]
 struct OpenNodePayload<'a> {
     node_url: &'a str,
+    node_origin: &'a str,
+    module_id: &'a str,
+    module_title: &'a str,
+    module_path: &'a str,
     cookie_name: &'a str,
     cookie_value: &'a str,
 }
@@ -32,7 +36,10 @@ struct DownloadNotificationPayload<'a> {
 struct CreateShortcutPayload<'a> {
     node_origin: &'a str,
     module_id: &'a str,
+    module_title: &'a str,
+    module_path: &'a str,
     name: &'a str,
+    icon_text: &'a str,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +47,8 @@ struct CreateShortcutPayload<'a> {
 pub struct ShortcutTarget {
     pub node_origin: String,
     pub module_id: String,
+    pub module_title: String,
+    pub module_path: String,
 }
 
 #[derive(Serialize)]
@@ -63,16 +72,46 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 }
 
 pub fn open<R: Runtime>(app: &AppHandle<R>, state: &AppState) -> AppResult<()> {
+    open_path(app, state, None)
+}
+
+pub fn open_path<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    module_path: Option<&str>,
+) -> AppResult<()> {
     let session = state.node_view_session()?;
     if session.cookie_value.is_empty() {
         return Err(AppError::SessionMissing);
     }
+    let target = match module_path {
+        Some(path) => {
+            if !path.starts_with('/') || path.starts_with("//") || path.contains('#') {
+                return Err(AppError::InvalidPackage("invalid module path".into()));
+            }
+            let target = session
+                .node_url
+                .join(path)
+                .map_err(|error| AppError::InvalidNodeUrl(error.to_string()))?;
+            if target.origin() != session.node_url.origin() {
+                return Err(AppError::InvalidNodeUrl(
+                    "module path leaves the node origin".into(),
+                ));
+            }
+            target.to_string()
+        }
+        None => session.node_url.to_string(),
+    };
     app.state::<MobileNodePlugin<R>>()
         .0
         .run_mobile_plugin::<()>(
             "open",
             OpenNodePayload {
-                node_url: session.node_url.as_str(),
+                node_url: &target,
+                node_origin: session.node_url.as_str(),
+                module_id: "",
+                module_title: "",
+                module_path: module_path.unwrap_or(""),
                 cookie_name: "access_token",
                 cookie_value: session.cookie_value.as_str(),
             },
@@ -83,6 +122,10 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, state: &AppState) -> AppResult<()> {
 pub fn open_offline<R: Runtime>(
     app: &AppHandle<R>,
     url: &str,
+    node_origin: &str,
+    module_id: &str,
+    module_title: &str,
+    module_path: &str,
     cookie_value: &str,
 ) -> AppResult<()> {
     app.state::<MobileNodePlugin<R>>()
@@ -91,6 +134,10 @@ pub fn open_offline<R: Runtime>(
             "open",
             OpenNodePayload {
                 node_url: url,
+                node_origin,
+                module_id,
+                module_title,
+                module_path,
                 cookie_name: crate::offline_gateway::SESSION_COOKIE,
                 cookie_value,
             },
@@ -116,7 +163,10 @@ pub fn create_shortcut<R: Runtime>(
     app: &AppHandle<R>,
     node_origin: &str,
     module_id: &str,
+    module_title: &str,
+    module_path: &str,
     name: &str,
+    icon_text: &str,
 ) -> AppResult<()> {
     app.state::<MobileNodePlugin<R>>()
         .0
@@ -125,7 +175,10 @@ pub fn create_shortcut<R: Runtime>(
             CreateShortcutPayload {
                 node_origin,
                 module_id,
+                module_title,
+                module_path,
                 name,
+                icon_text,
             },
         )
         .map_err(|error| AppError::Internal(error.to_string()))

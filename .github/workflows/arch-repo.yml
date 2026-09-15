@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published NetSanctum Desktop release tag
+        description: Published Netsanctum Client release tag
         required: true
         default: v1.0.0
 
@@ -36,17 +36,17 @@ jobs:
           version="${RELEASE_TAG#v}"
           mkdir -p dist
           gh release download "$RELEASE_TAG" \
-            --pattern "NetSanctum-Desktop_${version}_linux_amd64_deb.deb" \
+            --pattern "Netsanctum-Client_${version}_linux_amd64_deb.deb" \
             --dir dist
           package="$(scripts/package-arch.sh \
             "$version" \
-            "dist/NetSanctum-Desktop_${version}_linux_amd64_deb.deb" \
+            "dist/Netsanctum-Client_${version}_linux_amd64_deb.deb" \
             dist)"
           repo-add dist/netsanctum.db.tar.gz "$package"
           rm dist/netsanctum.db dist/netsanctum.files
           cp -L dist/netsanctum.db.tar.gz dist/netsanctum.db
           cp -L dist/netsanctum.files.tar.gz dist/netsanctum.files
-          rm "dist/NetSanctum-Desktop_${version}_linux_amd64_deb.deb"
+          rm "dist/Netsanctum-Client_${version}_linux_amd64_deb.deb"
       - name: Publish package and repository database
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,8 +54,8 @@ jobs:
         run: |
           if ! gh release view arch-repo >/dev/null 2>&1; then
             gh release create arch-repo \
-              --title "NetSanctum Desktop Arch repository" \
-              --notes "Unsigned pacman repository generated from official NetSanctum Desktop Debian releases." \
+              --title "Netsanctum Client Arch repository" \
+              --notes "Unsigned pacman repository generated from official Netsanctum Client Debian releases." \
               --latest=false
           fi
           gh release upload arch-repo \

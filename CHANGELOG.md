@@ -4,6 +4,23 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-09-15
+
+### Added
+
+- Smart Android module shortcuts with customizable names and icons.
+- Online session validation, vault unlock, and per-package offline fallback for shortcuts.
+- Background media playback support in the Android node WebView.
+
+### Changed
+
+- Renamed the product to Netsanctum Client and updated release artifact names.
+- Added immersive Android video fullscreen with dynamic system-bar insets.
+
+### Fixed
+
+- Preserved access to credential vaults created under the previous product name.
+
 ## [2.0.0] - 2026-09-15
 
 ### Added

@@ -42,7 +42,7 @@ done < <(ar t "$deb")
 ar p "$deb" "$data_member" | bsdtar -xf - -C "$package_root"
 
 test -x "$package_root/usr/bin/netsanctum-desktop"
-test -f "$package_root/usr/share/applications/NetSanctum Desktop.desktop"
+test -f "$package_root/usr/share/applications/Netsanctum Client.desktop" || test -f "$package_root/usr/share/applications/NetSanctum Desktop.desktop"
 
 install -Dm644 "$repo_root/LICENSE" \
   "$package_root/usr/share/licenses/netsanctum-desktop/LICENSE"
@@ -54,7 +54,7 @@ cat >"$package_root/.PKGINFO" <<EOF
 pkgname = netsanctum-desktop
 pkgbase = netsanctum-desktop
 pkgver = ${version}-1
-pkgdesc = Secure desktop and offline companion for NetSanctum
+pkgdesc = Secure client and offline companion for NetSanctum
 url = https://github.com/YatsenkoYura/NetSanctum-Desktop
 builddate = ${build_date}
 packager = NetSanctum contributors

@@ -49,6 +49,8 @@ export interface ConnectRequest {
 export interface ModuleShortcutTarget {
   nodeOrigin: string;
   moduleId: string;
+  moduleTitle: string;
+  modulePath: string;
 }
 
 export function bootstrap(): Promise<BootstrapState> {
@@ -57,6 +59,10 @@ export function bootstrap(): Promise<BootstrapState> {
 
 export function diagnoseNode(nodeUrl: string, allowInsecureHttp: boolean): Promise<string[]> {
   return invoke("diagnose_node", { nodeUrl, allowInsecureHttp });
+}
+
+export function shortcutOnlineAvailable(nodeOrigin: string): Promise<boolean> {
+  return invoke("shortcut_online_available", { nodeOrigin });
 }
 
 export function downloadPackage(manifestUrl: string): Promise<boolean> {
@@ -87,8 +93,16 @@ export function unlockVault(password: string): Promise<ConnectionState> {
   return invoke("unlock_vault", { password });
 }
 
+export function unlockShortcut(password: string): Promise<ConnectionState> {
+  return invoke("unlock_shortcut", { password });
+}
+
 export function openNode(): Promise<void> {
   return invoke("open_node");
+}
+
+export function openNodeModule(modulePath: string): Promise<void> {
+  return invoke("open_node_module", { modulePath });
 }
 
 export function isMobile(): Promise<boolean> {
@@ -98,9 +112,19 @@ export function isMobile(): Promise<boolean> {
 export function createModuleShortcut(
   nodeOrigin: string,
   moduleId: string,
+  moduleTitle: string,
+  modulePath: string,
   name: string,
+  iconText: string,
 ): Promise<void> {
-  return invoke("create_module_shortcut", { nodeOrigin, moduleId, name });
+  return invoke("create_module_shortcut", {
+    nodeOrigin,
+    moduleId,
+    moduleTitle,
+    modulePath,
+    name,
+    iconText,
+  });
 }
 
 export function takeMobileShortcut(): Promise<ModuleShortcutTarget | null> {
