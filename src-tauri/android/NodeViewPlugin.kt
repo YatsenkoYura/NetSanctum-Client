@@ -3,20 +3,40 @@ package dev.netsanctum.desktop
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.Dialog
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.os.Build
+import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.text.TextUtils
@@ -47,6 +67,7 @@ import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
@@ -54,12 +75,20 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
+import java.io.ByteArrayOutputStream
+import java.lang.ref.WeakReference
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.KeyStore
+import java.util.Locale
+import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -107,14 +136,42 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var pendingShortcutModule: String? = null
   private var pendingShortcutTitle: String? = null
   private var pendingShortcutPath: String? = null
+  private var mediaSession: MediaSession? = null
+  private var mediaWebView: WebView? = null
+  private var mediaTitle = "Netsanctum Client"
+  private var mediaSubtitle = "Media"
+  private var mediaArtwork: Bitmap? = null
+  private var mediaArtworkUrl: String? = null
+  private var mediaPlaying = false
+  private var mediaPositionMs = 0L
+  private var mediaDurationMs = -1L
+  private var mediaPlaybackRate = 1f
+  private var mediaWakeLock: PowerManager.WakeLock? = null
+  private var mediaServiceStarted = false
+  private var hasAudioFocus = false
+  private val mediaHandler = Handler(Looper.getMainLooper())
+  private val stopMediaService = Runnable {
+    mediaServiceStarted = false
+    MediaPlaybackService.stopPlayback()
+  }
+  private val releaseInactiveMedia = Runnable {
+    if (!mediaPlaying) releaseMedia()
+  }
+  private var audioFocusRequest: AudioFocusRequest? = null
+  private val artworkExecutor = Executors.newSingleThreadExecutor()
+  private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
+    if (change != AudioManager.AUDIOFOCUS_GAIN) controlMedia("pause")
+  }
 
   override fun load(webView: WebView) {
     shellWebView = webView
-    createNotificationChannel()
+    activePlugin = WeakReference(this)
+    createNotificationChannels()
     captureShortcut(activity.intent)
   }
 
   override fun onNewIntent(intent: Intent) {
+    if (handleMediaIntent(intent.action)) return
     captureShortcut(intent)
     activity.runOnUiThread {
       activeNodeDialog?.dismiss()
@@ -332,6 +389,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       var customView: View? = null
       var customViewCallback: WebChromeClient.CustomViewCallback? = null
       var isFullscreen = false
+      lateinit var nodeWebChromeClient: WebChromeClient
 
       fun hideSystemBars() {
         dialog.window?.let { window ->
@@ -371,7 +429,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       homeButton.setOnClickListener { dialog.dismiss() }
       backButton.setOnClickListener {
         if (customView != null) {
-          webView.webChromeClient?.onHideCustomView()
+          nodeWebChromeClient.onHideCustomView()
         } else if (webView.canGoBack()) {
           webView.goBack()
         } else {
@@ -405,8 +463,17 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       val preferences = activity.getSharedPreferences("netsanctum_ui", Activity.MODE_PRIVATE)
       webView.settings.textZoom = preferences.getInt("text_zoom", 100)
       webView.keepScreenOn = preferences.getBoolean("keep_screen_on", false)
+      val mediaOrigin = "${nodeUri.scheme}://${nodeUri.encodedAuthority}"
+      installMediaMessageListener(webView, nodeUri, args.moduleTitle, mediaOrigin)
+      if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+        WebViewCompat.addDocumentStartJavaScript(
+          webView,
+          mediaBridgeScript(preferences.getBoolean("background_media", true)),
+          setOf(mediaOrigin),
+        )
+      }
 
-      webView.webChromeClient = object : WebChromeClient() {
+      nodeWebChromeClient = object : WebChromeClient() {
         override fun onShowCustomView(view: View, callback: CustomViewCallback) {
           if (customView != null) {
             callback.onCustomViewHidden()
@@ -517,12 +584,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           return true
         }
       }
+      webView.webChromeClient = nodeWebChromeClient
 
       webView.webViewClient = object : WebViewClient() {
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
           super.onPageStarted(view, url, favicon)
           loading.visibility = View.VISIBLE
-          installBackgroundMediaBridge(view)
+          releaseMedia(view)
+          installMediaBridge(view, preferences.getBoolean("background_media", true))
         }
 
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -538,7 +607,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         override fun onPageFinished(view: WebView, url: String) {
           super.onPageFinished(view, url)
           loading.visibility = View.GONE
-          installBackgroundMediaBridge(view)
+          installMediaBridge(view, preferences.getBoolean("background_media", true))
           if (
             args.cookieName == "access_token" &&
             sameOrigin(nodeUri, Uri.parse(url))
@@ -590,7 +659,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
           false
         } else if (customView != null) {
-          webView.webChromeClient?.onHideCustomView()
+          nodeWebChromeClient.onHideCustomView()
           true
         } else if (webView.canGoBack()) {
           webView.goBack()
@@ -602,9 +671,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       }
       dialog.setOnDismissListener {
         if (customView != null) {
-          webView.webChromeClient?.onHideCustomView()
+          nodeWebChromeClient.onHideCustomView()
         }
         cookies.setCookie(args.nodeUrl, "${args.cookieName}=; Path=/; Max-Age=0$secure")
+        releaseMedia(webView)
         webView.stopLoading()
         webView.destroy()
         if (activeNodeDialog === dialog) activeNodeDialog = null
@@ -628,28 +698,90 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolve()
   }
 
-  private fun installBackgroundMediaBridge(webView: WebView) {
-    val script = """
+  private fun installMediaBridge(webView: WebView, backgroundMedia: Boolean) {
+    webView.evaluateJavascript(mediaBridgeScript(backgroundMedia), null)
+  }
+
+  private fun mediaBridgeScript(backgroundMedia: Boolean): String =
+    """
       (() => {
-        if (window.__NETSANCTUM_BG_MEDIA_INSTALLED__) return;
-        window.__NETSANCTUM_BG_MEDIA_INSTALLED__ = true;
+        if (window.top !== window) return;
+        window.__NETSANCTUM_BACKGROUND_MEDIA__ = $backgroundMedia;
+        if (window.__NETSANCTUM_MEDIA_INSTALLED__) return;
+        window.__NETSANCTUM_MEDIA_INSTALLED__ = true;
+        const nativeHidden = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden')?.get?.bind(document);
+        const nativeVisibility = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState')?.get?.bind(document);
         try {
-          Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-          Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-          Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
-          Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+          Object.defineProperty(document, 'hidden', { get: () => window.__NETSANCTUM_BACKGROUND_MEDIA__ ? false : (nativeHidden?.() ?? false), configurable: true });
+          Object.defineProperty(document, 'visibilityState', { get: () => window.__NETSANCTUM_BACKGROUND_MEDIA__ ? 'visible' : (nativeVisibility?.() ?? 'visible'), configurable: true });
+          Object.defineProperty(document, 'webkitHidden', { get: () => window.__NETSANCTUM_BACKGROUND_MEDIA__ ? false : document.hidden, configurable: true });
+          Object.defineProperty(document, 'webkitVisibilityState', { get: () => window.__NETSANCTUM_BACKGROUND_MEDIA__ ? 'visible' : document.visibilityState, configurable: true });
         } catch (_) {}
 
-        window.addEventListener('visibilitychange', (e) => {
-          e.stopImmediatePropagation();
-        }, true);
-        document.addEventListener('visibilitychange', (e) => {
-          e.stopImmediatePropagation();
-        }, true);
+        const preservePlayback = (event) => {
+          if (window.__NETSANCTUM_BACKGROUND_MEDIA__) event.stopImmediatePropagation();
+        };
+        window.addEventListener('visibilitychange', preservePlayback, true);
+        document.addEventListener('visibilitychange', preservePlayback, true);
+
+        let active = null;
+        let lastUpdate = 0;
+        const absoluteUrl = (value) => {
+          if (!value) return '';
+          try { return new URL(value, location.href).href; } catch (_) { return ''; }
+        };
+        const send = (force = false) => {
+          if (!active || active.ended || !active.isConnected) {
+            window.NetsanctumMedia?.postMessage(JSON.stringify({ active: false }));
+            active = null;
+            return;
+          }
+          const now = Date.now();
+          if (!force && now - lastUpdate < 900) return;
+          lastUpdate = now;
+          const metadata = navigator.mediaSession?.metadata;
+          const artwork = metadata?.artwork?.length
+            ? metadata.artwork[metadata.artwork.length - 1].src
+            : active.dataset.artwork || (active instanceof HTMLVideoElement ? active.poster : '') ||
+              document.querySelector('meta[property="og:image"], meta[name="twitter:image"]')?.content || '';
+          window.NetsanctumMedia?.postMessage(JSON.stringify({
+            active: true,
+            playing: !active.paused && !active.ended,
+            title: metadata?.title || active.dataset.title || active.getAttribute('aria-label') || document.title || '',
+            artist: metadata?.artist || active.dataset.artist || '',
+            album: metadata?.album || '',
+            artwork: absoluteUrl(artwork),
+            position: Number.isFinite(active.currentTime) ? active.currentTime : 0,
+            duration: Number.isFinite(active.duration) ? active.duration : -1,
+            playbackRate: Number.isFinite(active.playbackRate) ? active.playbackRate : 1
+          }));
+        };
+        const use = (event) => {
+          if (!(event.target instanceof HTMLMediaElement)) return;
+          if (event.type === 'play' || event.type === 'playing' || !active || active === event.target || active.ended || !active.isConnected) {
+            active = event.target;
+          } else {
+            return;
+          }
+          send(true);
+        };
+        ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'ratechange', 'emptied']
+          .forEach(name => document.addEventListener(name, use, true));
+        document.addEventListener('timeupdate', use, true);
+        window.__NETSANCTUM_MEDIA_CONTROL__ = (action, value) => {
+          if (!active) active = [...document.querySelectorAll('audio,video')].find(item => !item.paused) || null;
+          if (!active) return;
+          if (action === 'play') active.play().catch(() => {});
+          else if (action === 'pause') active.pause();
+          else if (action === 'seek') active.currentTime = Math.max(0, Math.min(active.duration || Infinity, Number(value) || 0));
+          else if (action === 'back') active.currentTime = Math.max(0, active.currentTime - 10);
+          else if (action === 'forward') active.currentTime = Math.min(active.duration || Infinity, active.currentTime + 10);
+          send(true);
+        };
+        active = [...document.querySelectorAll('audio,video')].find(item => !item.paused) || null;
+        if (active) send(true);
       })();
     """.trimIndent()
-    webView.evaluateJavascript(script, null)
-  }
 
   private fun installDownloadBridge(webView: WebView, nodeUri: Uri) {
     val origin = "${nodeUri.scheme}://${nodeUri.encodedAuthority}"
@@ -694,15 +826,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         style.id = 'netsanctum-mobile-offline';
         style.textContent = `
           html, body { width: 100% !important; max-width: 100vw !important; min-width: 0 !important; overflow-x: hidden !important; }
-          #main-content { width: 100% !important; max-width: 100% !important; min-width: 0 !important; padding: 0.75rem !important; }
-          img, video, canvas, svg { max-width: 100% !important; }
-          #player-grid-wrapper, #playlist-player-wrapper { display: flex !important; flex-direction: column !important; width: 100% !important; min-width: 0 !important; padding: 0.5rem !important; gap: 0.75rem !important; }
-          #player-main-col, #player-side-col { width: 100% !important; max-width: 100% !important; min-width: 0 !important; position: static !important; }
-          .aspect-video { width: 100% !important; max-width: 100% !important; height: auto !important; min-height: 0 !important; aspect-ratio: 16 / 9 !important; }
-          .custom-video-player, .custom-video-player video { width: 100% !important; height: 100% !important; object-fit: contain !important; }
-          .custom-controls { padding: 0.5rem !important; }
-          .custom-controls .gap-4 { gap: 0.5rem !important; }
-          .settings-menu-container, .vol-slider { display: none !important; }
+          main, img, video, audio, canvas, svg { max-width: 100% !important; min-width: 0 !important; }
+          video { width: 100% !important; height: auto !important; object-fit: contain !important; }
           :fullscreen, :-webkit-full-screen { width: 100vw !important; height: 100vh !important; max-width: 100vw !important; max-height: 100vh !important; margin: 0 !important; padding: 0 !important; background: #000 !important; }
           :fullscreen video, :-webkit-full-screen video { width: 100% !important; height: 100% !important; max-width: 100vw !important; max-height: 100vh !important; object-fit: contain !important; }
         `;
@@ -797,7 +922,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     val choices = scales.map { "ТЕКСТ $it%" } +
       listOf(
         "ЭКРАН: ${if (keepScreenOn) "НЕ ГАСИТЬ" else "ОБЫЧНО"}",
-        "ФОНОВОЕ АУДИО: ${if (backgroundMedia) "ВКЛ" else "ВЫКЛ"}",
+        "ФОНОВОЕ МЕДИА: ${if (backgroundMedia) "ВКЛ" else "ВЫКЛ"}",
         "ДОБАВИТЬ ЯРЛЫК",
         "ОЧИСТИТЬ WEB-КЭШ",
       )
@@ -816,6 +941,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         index == scales.size + 1 -> {
           val enabled = !backgroundMedia
           preferences.edit().putBoolean("background_media", enabled).apply()
+          webView.evaluateJavascript(
+            "window.__NETSANCTUM_BACKGROUND_MEDIA__=${if (enabled) "true" else "false"}",
+            null,
+          )
         }
         index == scales.size + 2 ->
           showShortcutDialog(webView, nodeUri, moduleId, moduleTitle, modulePath)
@@ -1122,7 +1251,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     paint.textAlign = Paint.Align.CENTER
     paint.textSize = 58f
-    val initials = iconText.take(2).uppercase().ifEmpty { "NC" }
+    val initials = iconText.take(2).uppercase(Locale.ROOT).ifEmpty { "NC" }
     val baseline = size / 2f - (paint.ascent() + paint.descent()) / 2f
     canvas.drawText(initials, size / 2f, baseline, paint)
     return bitmap
@@ -1149,6 +1278,379 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     activity.getSharedPreferences(VAULT_PREFS, Activity.MODE_PRIVATE).edit().clear().apply()
     val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     if (keyStore.containsAlias(VAULT_KEY_ALIAS)) keyStore.deleteEntry(VAULT_KEY_ALIAS)
+  }
+
+  private fun installMediaMessageListener(
+    webView: WebView,
+    nodeUri: Uri,
+    moduleTitle: String,
+    mediaOrigin: String,
+  ) {
+    if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) return
+    WebViewCompat.addWebMessageListener(webView, MEDIA_BRIDGE, setOf(mediaOrigin)) {
+        sourceView, message, sourceOrigin, isMainFrame, _ ->
+      val payload = message.data ?: return@addWebMessageListener
+      if (!isMainFrame || sourceOrigin == null || !sameOrigin(nodeUri, sourceOrigin) || payload.length > 32_768) {
+        return@addWebMessageListener
+      }
+      val update = try {
+        org.json.JSONObject(payload)
+      } catch (_: Exception) {
+        return@addWebMessageListener
+      }
+      activity.runOnUiThread { updateMediaSession(sourceView, moduleTitle, update) }
+    }
+  }
+
+  private fun updateMediaSession(webView: WebView, moduleTitle: String, update: org.json.JSONObject) {
+    if (!update.optBoolean("active")) {
+      if (mediaWebView !== webView) return
+      mediaPlaying = false
+      updatePlaybackState()
+      abandonAudioFocus()
+      releaseMediaWakeLock()
+      publishMediaNotification()
+      mediaHandler.removeCallbacks(releaseInactiveMedia)
+      mediaHandler.postDelayed(releaseInactiveMedia, MEDIA_TRANSITION_GRACE_MS)
+      return
+    }
+    mediaHandler.removeCallbacks(releaseInactiveMedia)
+    mediaHandler.removeCallbacks(stopMediaService)
+    val previousTitle = mediaTitle
+    mediaWebView = webView
+    mediaPlaying = update.optBoolean("playing")
+    mediaTitle = update.optString("title").trim().take(256).ifEmpty { moduleTitle.ifEmpty { "Netsanctum Client" } }
+    mediaSubtitle = update.optString("artist").trim().take(256)
+      .ifEmpty { update.optString("album").trim().take(256) }
+      .ifEmpty { moduleTitle.ifEmpty { "Netsanctum" } }
+    mediaPositionMs = (update.optDouble("position", 0.0).coerceAtLeast(0.0) * 1_000).toLong()
+    mediaDurationMs = update.optDouble("duration", -1.0)
+      .takeIf { it.isFinite() && it >= 0.0 }
+      ?.times(1_000)
+      ?.toLong() ?: -1L
+    mediaPlaybackRate = update.optDouble("playbackRate", 1.0)
+      .takeIf { it.isFinite() && it > 0.0 }
+      ?.toFloat() ?: 1f
+
+    ensureMediaSession()
+    updatePlaybackState()
+    val artworkUrl = update.optString("artwork").trim()
+    if (artworkUrl != mediaArtworkUrl || (artworkUrl.isEmpty() && previousTitle != mediaTitle)) {
+      mediaArtworkUrl = artworkUrl
+      mediaArtwork = makeMediaArtwork(mediaTitle)
+      updateMediaMetadata()
+      if (artworkUrl.isNotEmpty()) loadMediaArtwork(webView, artworkUrl)
+    } else {
+      updateMediaMetadata()
+    }
+
+    if (mediaPlaying) {
+      requestAudioFocus()
+      acquireMediaWakeLock()
+      startMediaService()
+    } else {
+      abandonAudioFocus()
+      releaseMediaWakeLock()
+      mediaHandler.postDelayed(stopMediaService, MEDIA_PAUSE_GRACE_MS)
+    }
+    publishMediaNotification()
+  }
+
+  private fun ensureMediaSession() {
+    if (mediaSession != null) return
+    mediaSession = MediaSession(activity, "NetsanctumMedia").apply {
+      setCallback(object : MediaSession.Callback() {
+        override fun onPlay() = controlMedia("play")
+        override fun onPause() = controlMedia("pause")
+        override fun onStop() = controlMedia("pause")
+        override fun onSeekTo(position: Long) = controlMedia("seek", position / 1_000.0)
+        override fun onRewind() = controlMedia("back")
+        override fun onFastForward() = controlMedia("forward")
+      })
+      setSessionActivity(contentIntent())
+      isActive = true
+    }
+  }
+
+  private fun updatePlaybackState() {
+    val actions = PlaybackState.ACTION_PLAY or
+      PlaybackState.ACTION_PAUSE or
+      PlaybackState.ACTION_PLAY_PAUSE or
+      PlaybackState.ACTION_SEEK_TO or
+      PlaybackState.ACTION_REWIND or
+      PlaybackState.ACTION_FAST_FORWARD or
+      PlaybackState.ACTION_STOP
+    val state = if (mediaPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+    mediaSession?.setPlaybackState(
+      PlaybackState.Builder()
+        .setActions(actions)
+        .setState(state, mediaPositionMs, if (mediaPlaying) mediaPlaybackRate else 0f, SystemClock.elapsedRealtime())
+        .build(),
+    )
+  }
+
+  private fun updateMediaMetadata() {
+    val metadata = MediaMetadata.Builder()
+      .putString(MediaMetadata.METADATA_KEY_TITLE, mediaTitle)
+      .putString(MediaMetadata.METADATA_KEY_ARTIST, mediaSubtitle)
+      .putString(MediaMetadata.METADATA_KEY_ALBUM, "Netsanctum Client")
+      .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, mediaArtwork)
+      .putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, mediaArtwork)
+    if (mediaDurationMs >= 0) metadata.putLong(MediaMetadata.METADATA_KEY_DURATION, mediaDurationMs)
+    mediaSession?.setMetadata(metadata.build())
+  }
+
+  private fun controlMedia(action: String, value: Double? = null) {
+    val webView = mediaWebView ?: return
+    val argument = value?.toString() ?: "null"
+    webView.post {
+      webView.evaluateJavascript(
+        "window.__NETSANCTUM_MEDIA_CONTROL__?.(${org.json.JSONObject.quote(action)},$argument)",
+        null,
+      )
+    }
+  }
+
+  private fun handleMediaIntent(action: String?): Boolean {
+    when (action) {
+      ACTION_MEDIA_PLAY -> controlMedia("play")
+      ACTION_MEDIA_PAUSE -> controlMedia("pause")
+      ACTION_MEDIA_BACK -> controlMedia("back")
+      ACTION_MEDIA_FORWARD -> controlMedia("forward")
+      else -> return false
+    }
+    return true
+  }
+
+  private fun requestAudioFocus() {
+    if (hasAudioFocus) return
+    val audioManager = activity.getSystemService(AudioManager::class.java)
+    val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+        .setAudioAttributes(
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+            .build(),
+        )
+        .setOnAudioFocusChangeListener(audioFocusListener)
+        .setWillPauseWhenDucked(true)
+        .build()
+        .also { audioFocusRequest = it }
+      audioManager.requestAudioFocus(request)
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+    }
+    hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+  }
+
+  private fun abandonAudioFocus() {
+    if (!hasAudioFocus) return
+    val audioManager = activity.getSystemService(AudioManager::class.java)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      audioFocusRequest?.let(audioManager::abandonAudioFocusRequest)
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.abandonAudioFocus(audioFocusListener)
+    }
+    hasAudioFocus = false
+  }
+
+  private fun acquireMediaWakeLock() {
+    if (mediaWakeLock?.isHeld == true) return
+    mediaWakeLock = (activity.getSystemService(Context.POWER_SERVICE) as PowerManager)
+      .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Netsanctum:MediaPlayback")
+      .apply {
+        setReferenceCounted(false)
+        acquire(12 * 60 * 60 * 1_000L)
+      }
+  }
+
+  private fun releaseMediaWakeLock() {
+    mediaWakeLock?.takeIf { it.isHeld }?.release()
+    mediaWakeLock = null
+  }
+
+  private fun startMediaService() {
+    if (mediaServiceStarted) return
+    try {
+      mediaServiceStarted = true
+      ContextCompat.startForegroundService(activity, Intent(activity, MediaPlaybackService::class.java))
+    } catch (_: RuntimeException) {
+      mediaServiceStarted = false
+    }
+  }
+
+  private fun publishMediaNotification() {
+    try {
+      activity.getSystemService(NotificationManager::class.java)
+        .notify(MEDIA_NOTIFICATION_ID, buildMediaNotification())
+    } catch (_: SecurityException) {
+      requestNotificationPermission()
+    }
+  }
+
+  internal fun buildMediaNotification(): Notification {
+    val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      Notification.Builder(activity, MEDIA_CHANNEL)
+    } else {
+      @Suppress("DEPRECATION")
+      Notification.Builder(activity)
+    }
+    val toggleAction = if (mediaPlaying) ACTION_MEDIA_PAUSE else ACTION_MEDIA_PLAY
+    val toggleIcon = if (mediaPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+    return builder
+      .setSmallIcon(activity.applicationInfo.icon)
+      .setLargeIcon(mediaArtwork ?: makeMediaArtwork(mediaTitle))
+      .setContentTitle(mediaTitle)
+      .setContentText(mediaSubtitle)
+      .setSubText("NETSANCTUM")
+      .setColor(Color.rgb(15, 185, 166))
+      .setCategory(Notification.CATEGORY_TRANSPORT)
+      .setVisibility(Notification.VISIBILITY_PUBLIC)
+      .setOnlyAlertOnce(true)
+      .setShowWhen(false)
+      .setOngoing(mediaPlaying)
+      .setContentIntent(contentIntent())
+      .addAction(notificationAction(android.R.drawable.ic_media_rew, "Назад 10 с", ACTION_MEDIA_BACK, 1))
+      .addAction(notificationAction(toggleIcon, if (mediaPlaying) "Пауза" else "Играть", toggleAction, 2))
+      .addAction(notificationAction(android.R.drawable.ic_media_ff, "Вперёд 10 с", ACTION_MEDIA_FORWARD, 3))
+      .setStyle(
+        Notification.MediaStyle()
+          .setMediaSession(mediaSession?.sessionToken)
+          .setShowActionsInCompactView(0, 1, 2),
+      )
+      .build()
+  }
+
+  private fun notificationAction(icon: Int, title: String, action: String, requestCode: Int): Notification.Action =
+    Notification.Action.Builder(Icon.createWithResource(activity, icon), title, PendingIntent.getBroadcast(
+      activity,
+      requestCode,
+      Intent(activity, MediaActionReceiver::class.java).setAction(action),
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )).build()
+
+  private fun contentIntent(): PendingIntent {
+    val intent = activity.packageManager.getLaunchIntentForPackage(activity.packageName)
+      ?: Intent(activity, activity::class.java)
+    return PendingIntent.getActivity(
+      activity,
+      0,
+      intent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+  }
+
+  private fun loadMediaArtwork(webView: WebView, artworkUrl: String) {
+    val pageUri = Uri.parse(webView.url ?: return)
+    val artworkUri = Uri.parse(artworkUrl)
+    if (artworkUri.scheme !in setOf("https", "http") || !sameOrigin(pageUri, artworkUri)) return
+    val cookie = CookieManager.getInstance().getCookie(artworkUrl)
+    artworkExecutor.execute {
+      val bitmap = try {
+        val connection = URL(artworkUrl).openConnection() as HttpURLConnection
+        connection.connectTimeout = 5_000
+        connection.readTimeout = 10_000
+        connection.instanceFollowRedirects = false
+        cookie?.let { connection.setRequestProperty("Cookie", it) }
+        val data = connection.inputStream.use { input ->
+          val bytes = ByteArrayOutputStream()
+          val buffer = ByteArray(16_384)
+          var total = 0
+          while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > MAX_ARTWORK_BYTES) throw IllegalArgumentException("Artwork is too large")
+            bytes.write(buffer, 0, read)
+          }
+          bytes.toByteArray()
+        }
+        connection.disconnect()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(data, 0, data.size, bounds)
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > 1_024 || bounds.outHeight / sampleSize > 1_024) {
+          sampleSize *= 2
+        }
+        BitmapFactory.decodeByteArray(
+          data,
+          0,
+          data.size,
+          BitmapFactory.Options().apply { inSampleSize = sampleSize },
+        )
+      } catch (_: Exception) {
+        null
+      }
+      if (bitmap != null) {
+        activity.runOnUiThread {
+          if (mediaWebView === webView && mediaArtworkUrl == artworkUrl) {
+            mediaArtwork = bitmap
+            updateMediaMetadata()
+            publishMediaNotification()
+          }
+        }
+      }
+    }
+  }
+
+  private fun makeMediaArtwork(title: String): Bitmap {
+    val size = 512
+    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    paint.shader = LinearGradient(
+      0f,
+      0f,
+      size.toFloat(),
+      size.toFloat(),
+      intArrayOf(Color.rgb(3, 18, 17), Color.rgb(13, 78, 70), Color.rgb(45, 212, 191)),
+      null,
+      Shader.TileMode.CLAMP,
+    )
+    canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), paint)
+    paint.shader = null
+    paint.style = Paint.Style.STROKE
+    paint.strokeWidth = 6f
+    paint.color = Color.argb(150, 153, 246, 228)
+    canvas.drawRect(28f, 28f, size - 28f, size - 28f, paint)
+    paint.style = Paint.Style.FILL
+    paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    paint.textAlign = Paint.Align.CENTER
+    paint.color = Color.WHITE
+    paint.textSize = 76f
+    canvas.drawText("NS", size / 2f, 238f, paint)
+    paint.color = Color.rgb(153, 246, 228)
+    paint.textSize = 22f
+    paint.letterSpacing = 0.18f
+    canvas.drawText("NETSANCTUM", size / 2f, 285f, paint)
+    paint.color = Color.argb(210, 229, 241, 238)
+    paint.textSize = 19f
+    paint.letterSpacing = 0.02f
+    val caption = title.uppercase(Locale.ROOT).replace(Regex("\\s+"), " ").take(34)
+    canvas.drawText(caption, size / 2f, 382f, paint)
+    return bitmap
+  }
+
+  private fun releaseMedia(webView: WebView? = null) {
+    if (webView != null && mediaWebView !== webView) return
+    mediaHandler.removeCallbacks(releaseInactiveMedia)
+    mediaHandler.removeCallbacks(stopMediaService)
+    abandonAudioFocus()
+    releaseMediaWakeLock()
+    MediaPlaybackService.stopPlayback()
+    activity.stopService(Intent(activity, MediaPlaybackService::class.java))
+    mediaServiceStarted = false
+    activity.getSystemService(NotificationManager::class.java).cancel(MEDIA_NOTIFICATION_ID)
+    mediaSession?.isActive = false
+    mediaSession?.release()
+    mediaSession = null
+    mediaWebView = null
+    mediaPlaying = false
+    mediaArtwork = null
+    mediaArtworkUrl = null
   }
 
   private fun dp(value: Int): Int =
@@ -1199,20 +1701,40 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  private fun createNotificationChannel() {
+  private fun createNotificationChannels() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-    val channel = NotificationChannel(
+    val downloadChannel = NotificationChannel(
       DOWNLOAD_CHANNEL,
       "Загрузки Netsanctum Client",
       NotificationManager.IMPORTANCE_LOW,
     )
-    activity.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    val mediaChannel = NotificationChannel(
+      MEDIA_CHANNEL,
+      "Медиа Netsanctum Client",
+      NotificationManager.IMPORTANCE_LOW,
+    ).apply {
+      description = "Управление аудио и видео из модулей Netsanctum"
+      setShowBadge(false)
+    }
+    activity.getSystemService(NotificationManager::class.java)
+      .createNotificationChannels(listOf(downloadChannel, mediaChannel))
   }
 
   companion object {
+    @Volatile private var activePlugin: WeakReference<NodeViewPlugin>? = null
     private const val DOWNLOAD_CHANNEL = "netsanctum_downloads"
     private const val DOWNLOAD_NOTIFICATION_ID = 4101
     private const val NOTIFICATION_PERMISSION_REQUEST = 4102
+    private const val MEDIA_CHANNEL = "netsanctum_media"
+    internal const val MEDIA_NOTIFICATION_ID = 4201
+    private const val MEDIA_BRIDGE = "NetsanctumMedia"
+    private const val MAX_ARTWORK_BYTES = 8 * 1024 * 1024
+    private const val MEDIA_TRANSITION_GRACE_MS = 30_000L
+    private const val MEDIA_PAUSE_GRACE_MS = 30_000L
+    internal const val ACTION_MEDIA_PLAY = "dev.netsanctum.desktop.MEDIA_PLAY"
+    internal const val ACTION_MEDIA_PAUSE = "dev.netsanctum.desktop.MEDIA_PAUSE"
+    internal const val ACTION_MEDIA_BACK = "dev.netsanctum.desktop.MEDIA_BACK"
+    internal const val ACTION_MEDIA_FORWARD = "dev.netsanctum.desktop.MEDIA_FORWARD"
     private const val ACTION_OPEN_SMART_MODULE = "dev.netsanctum.desktop.OPEN_SMART_MODULE"
     private const val LEGACY_ACTION_OPEN_OFFLINE_MODULE = "dev.netsanctum.desktop.OPEN_OFFLINE_MODULE"
     private const val EXTRA_NODE_ORIGIN = "node_origin"
@@ -1221,6 +1743,17 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     private const val EXTRA_MODULE_PATH = "module_path"
     private const val VAULT_PREFS = "netsanctum_vault_key"
     private const val VAULT_KEY_ALIAS = "netsanctum_vault_key_v1"
+
+    internal fun dispatchMediaAction(action: String?) {
+      activePlugin?.get()?.handleMediaIntent(action)
+    }
+
+    internal fun foregroundMediaNotification(): Notification? =
+      activePlugin?.get()?.takeIf { it.mediaPlaying }?.buildMediaNotification()
+
+    internal fun mediaServiceStopped() {
+      activePlugin?.get()?.mediaServiceStarted = false
+    }
   }
 
   private fun sameOrigin(expected: Uri, actual: Uri): Boolean {
@@ -1232,5 +1765,54 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     return expected.scheme == actual.scheme &&
       expected.host == actual.host &&
       effectivePort(expected) == effectivePort(actual)
+  }
+}
+
+class MediaActionReceiver : BroadcastReceiver() {
+  override fun onReceive(context: Context, intent: Intent) {
+    NodeViewPlugin.dispatchMediaAction(intent.action)
+  }
+}
+
+class MediaPlaybackService : Service() {
+  override fun onCreate() {
+    super.onCreate()
+    activeService = WeakReference(this)
+  }
+
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    val notification = NodeViewPlugin.foregroundMediaNotification()
+    if (notification == null) {
+      stopSelf()
+      return START_NOT_STICKY
+    }
+    startForeground(NodeViewPlugin.MEDIA_NOTIFICATION_ID, notification)
+    return START_NOT_STICKY
+  }
+
+  override fun onDestroy() {
+    if (activeService?.get() === this) activeService = null
+    NodeViewPlugin.mediaServiceStopped()
+    super.onDestroy()
+  }
+
+  private fun stopPlaybackService() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      stopForeground(STOP_FOREGROUND_DETACH)
+    } else {
+      @Suppress("DEPRECATION")
+      stopForeground(false)
+    }
+    stopSelf()
+  }
+
+  companion object {
+    @Volatile private var activeService: WeakReference<MediaPlaybackService>? = null
+
+    internal fun stopPlayback() {
+      activeService?.get()?.stopPlaybackService()
+    }
   }
 }

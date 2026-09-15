@@ -175,7 +175,12 @@ async fn resolve_resource(
                 .library
                 .resource(&session.node_origin, package_id, resource_url)?
         {
-            return Ok(Some(Segment::File(resource)));
+            if tokio::fs::metadata(&resource.local_path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+            {
+                return Ok(Some(Segment::File(resource)));
+            }
         }
     }
     let mut entries = Vec::new();
@@ -186,6 +191,12 @@ async fn resolve_resource(
         else {
             continue;
         };
+        if !tokio::fs::metadata(&container.local_path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            continue;
+        }
         let index = nsp_index(runtime, &container.local_path).await?;
         if let Some(entry) = index
             .get(resource_url)
@@ -412,7 +423,13 @@ fn offline_csp() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use super::{OfflineSession, Runtime, Segment, parse_range, resolve_resource};
+    use crate::library::Library;
 
     #[test]
     fn parses_media_ranges() {
@@ -423,5 +440,71 @@ mod tests {
         );
         assert_eq!((90, 99, true), parse_range(Some("bytes=-10"), 100).unwrap());
         assert_eq!((50, 99, true), parse_range(Some("bytes=50-"), 100).unwrap());
+    }
+
+    #[test]
+    fn skips_missing_resource_and_uses_next_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::open(directory.path()).unwrap());
+        for package_id in ["missing", "available"] {
+            library
+                .begin_package(
+                    "https://node.example",
+                    "media",
+                    "Media",
+                    "/media",
+                    package_id,
+                    package_id,
+                    "/media",
+                    "1",
+                )
+                .unwrap();
+        }
+        let missing = directory.path().join("missing.bin");
+        let available = directory.path().join("available.bin");
+        std::fs::write(&available, b"media").unwrap();
+        library
+            .record_resource(
+                "https://node.example",
+                "missing",
+                "/media/file",
+                "file",
+                missing.to_str().unwrap(),
+                Some("audio/mpeg"),
+                5,
+                "missing",
+            )
+            .unwrap();
+        library
+            .record_resource(
+                "https://node.example",
+                "available",
+                "/media/file",
+                "file",
+                available.to_str().unwrap(),
+                Some("audio/mpeg"),
+                5,
+                "available",
+            )
+            .unwrap();
+        let runtime = Runtime {
+            library,
+            session: RwLock::new(None),
+            nsp_cache: RwLock::new(HashMap::new()),
+        };
+        let session = OfflineSession {
+            token: "token".into(),
+            node_origin: "https://node.example".into(),
+            package_ids: vec!["missing".into(), "available".into()],
+        };
+
+        let segment =
+            tauri::async_runtime::block_on(resolve_resource(&runtime, &session, "/media/file"))
+                .unwrap()
+                .unwrap();
+        match segment {
+            Segment::File(resource) => assert_eq!(resource.local_path, available.to_str().unwrap()),
+            _ => panic!("expected direct file resource"),
+        }
     }
 }

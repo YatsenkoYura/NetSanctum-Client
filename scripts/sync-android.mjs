@@ -30,6 +30,18 @@ if (!manifest.includes("android.permission.POST_NOTIFICATIONS")) {
     '<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
   );
 }
+if (!manifest.includes("android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK")) {
+  manifest = manifest.replace(
+    '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+    '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />\n    <uses-permission android:name="android.permission.WAKE_LOCK" />',
+  );
+}
+if (!manifest.includes('android:name=".MediaPlaybackService"')) {
+  manifest = manifest.replace(
+    "        <provider",
+    '        <receiver\n            android:name=".MediaActionReceiver"\n            android:exported="false" />\n\n        <service\n            android:name=".MediaPlaybackService"\n            android:exported="false"\n            android:foregroundServiceType="mediaPlayback" />\n\n        <provider',
+  );
+}
 if (!manifest.includes("android:networkSecurityConfig")) {
   manifest = manifest.replace(
     'android:usesCleartextTraffic="${usesCleartextTraffic}">',

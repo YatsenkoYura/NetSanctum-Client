@@ -62,7 +62,7 @@ struct DownloadContext<'a> {
     app: &'a AppHandle,
     state: &'a AppState,
     session: &'a DownloadSession,
-    package_directory: &'a Path,
+    download_directory: &'a Path,
     package_id: &'a str,
     resource_count: usize,
 }
@@ -162,12 +162,22 @@ async fn run(app: &AppHandle, manifest_url: &str) -> AppResult<String> {
         package_directory(&session.data_dir, &node_origin, &manifest.package_id);
     tokio::fs::create_dir_all(&package_directory)
         .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|error| storage_error("create package directory", &package_directory, error))?;
     crate::atomic_file::write_async(package_directory.join("manifest.json"), manifest_bytes)
         .await?;
 
+    let download_directory = session
+        .data_dir
+        .join("downloads")
+        .join(digest_hex(&node_origin))
+        .join(digest_hex(&manifest.package_id))
+        .join(digest_hex(manifest_url));
+    tokio::fs::create_dir_all(&download_directory)
+        .await
+        .map_err(|error| storage_error("create download directory", &download_directory, error))?;
     let result =
-        download_resources(app, &session, &node_origin, &manifest, &package_directory).await;
+        download_resources(app, &session, &node_origin, &manifest, &download_directory).await;
+    let _ = tokio::fs::remove_dir_all(&download_directory).await;
     match result {
         Ok(total_size) => {
             state.library().finish_package(
@@ -193,7 +203,7 @@ async fn download_resources(
     session: &DownloadSession,
     node_origin: &str,
     manifest: &PackageManifest,
-    package_directory: &Path,
+    download_directory: &Path,
 ) -> AppResult<u64> {
     let state = app.state::<AppState>();
     let mut total_size = 0_u64;
@@ -202,7 +212,7 @@ async fn download_resources(
         app,
         state: &state,
         session,
-        package_directory,
+        download_directory,
         package_id: &manifest.package_id,
         resource_count,
     };
@@ -251,7 +261,7 @@ async fn download_resource(
     let app = context.app;
     let state = context.state;
     let session = context.session;
-    let package_directory = context.package_directory;
+    let download_directory = context.download_directory;
     let package_id = context.package_id;
     let resource_count = context.resource_count;
     if !state.session_is_current(session.generation) {
@@ -292,11 +302,14 @@ async fn download_resource(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    tokio::fs::create_dir_all(download_directory)
+        .await
+        .map_err(|error| storage_error("create download directory", download_directory, error))?;
     let temporary_path =
-        package_directory.join(format!("resource-{}.part", digest_hex(&resource.url)));
+        download_directory.join(format!("resource-{}.part", digest_hex(&resource.url)));
     let mut file = tokio::fs::File::create(&temporary_path)
         .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|error| storage_error("create temporary resource", &temporary_path, error))?;
     let mut stream = response.bytes_stream();
     let mut hasher = Sha256::new();
     let mut byte_size = 0_u64;
@@ -322,7 +335,7 @@ async fn download_resource(
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|error| storage_error("write temporary resource", &temporary_path, error))?;
         if let Some(expected_size) = expected_size.filter(|size| *size > 0) {
             let resource_progress = (byte_size as f64 / expected_size as f64).min(1.0);
             let progress =
@@ -344,10 +357,10 @@ async fn download_resource(
     }
     file.flush()
         .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|error| storage_error("flush temporary resource", &temporary_path, error))?;
     file.sync_all()
         .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|error| storage_error("sync temporary resource", &temporary_path, error))?;
     drop(file);
 
     if resource.size.is_some_and(|expected| expected != byte_size) {
@@ -372,16 +385,16 @@ async fn download_resource(
     let object_directory = session.data_dir.join("objects").join(&sha256[..2]);
     tokio::fs::create_dir_all(&object_directory)
         .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
+        .map_err(|error| storage_error("create object directory", &object_directory, error))?;
     let local_path = object_directory.join(&sha256);
     if local_path.exists() {
         tokio::fs::remove_file(&temporary_path)
             .await
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|error| storage_error("remove duplicate resource", &temporary_path, error))?;
     } else {
         tokio::fs::rename(&temporary_path, &local_path)
             .await
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+            .map_err(|error| storage_error("store downloaded resource", &local_path, error))?;
     }
     Ok(DownloadedResource {
         local_path,
@@ -389,6 +402,10 @@ async fn download_resource(
         byte_size,
         sha256,
     })
+}
+
+fn storage_error(operation: &str, path: &Path, error: std::io::Error) -> AppError {
+    AppError::Storage(format!("{operation} at {}: {error}", path.display()))
 }
 
 fn validate_manifest(manifest: &PackageManifest) -> AppResult<()> {

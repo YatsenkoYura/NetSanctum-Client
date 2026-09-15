@@ -4,6 +4,20 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-09-16
+
+### Added
+
+- Android media controls with shared audio and video metadata, artwork, seeking, audio focus, and background playback.
+
+### Changed
+
+- Replaced module-specific Android player styling with generic responsive media handling.
+
+### Fixed
+
+- Prevented missing temporary or stale object files from breaking offline package saves and playback.
+
 ## [2.0.1] - 2026-09-15
 
 ### Added

@@ -99,6 +99,8 @@ pub struct DownloadSession {
 
 impl AppState {
     pub fn new(data_dir: &Path) -> AppResult<Self> {
+        // Downloads are staged separately from completed objects and are never valid after restart.
+        let _ = std::fs::remove_dir_all(data_dir.join("downloads"));
         let config_store = ConfigStore::new(data_dir);
         let config = config_store.load()?;
         let credentials = CredentialStore::new(data_dir);
