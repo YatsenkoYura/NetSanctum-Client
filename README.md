@@ -5,7 +5,7 @@ Native desktop and offline client for [NetSanctum](https://github.com/YatsenkoYu
 NetSanctum Desktop connects to an existing node. It does not run Docker, PostgreSQL, Redis, Celery, or module Python code on the user's computer. Online modules are rendered in a sandboxed WebView; selected module packages can be downloaded and opened through the local offline runtime.
 
 > [!WARNING]
-> NetSanctum Desktop 1.1 adds the Android client. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
+> NetSanctum Desktop 2.0 unifies the desktop and Android clients in one release line. Offline package contracts are versioned, but the project is still evolving. Keep a backup of important data stored on the server.
 
 ## Features
 
@@ -161,11 +161,11 @@ pre-commit install
 All version sources are kept in sync by `scripts/version.mjs`.
 
 ```bash
-npm run version:set -- 1.1.0
+npm run version:set -- 2.0.0
 npm run version:check
-git commit -am "chore(release): prepare v1.1.0"
-git tag -a v1.1.0 -m "NetSanctum Desktop v1.1.0"
-git push origin main v1.1.0
+git commit -am "chore(release): prepare v2.0.0"
+git tag -a v2.0.0 -m "NetSanctum Desktop v2.0.0"
+git push origin main v2.0.0
 ```
 
 The tag must exactly match the version in `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json`. GitHub Actions builds every installer into a draft and publishes the release only after all jobs succeed.
