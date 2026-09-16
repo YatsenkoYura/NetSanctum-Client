@@ -19,14 +19,12 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
@@ -141,6 +139,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var mediaTitle = "Netsanctum Client"
   private var mediaSubtitle = "Media"
   private var mediaArtwork: Bitmap? = null
+  private var mediaArtworkSource: Bitmap? = null
   private var mediaArtworkUrl: String? = null
   private var mediaPlaying = false
   private var mediaPositionMs = 0L
@@ -148,7 +147,6 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var mediaPlaybackRate = 1f
   private var mediaWakeLock: PowerManager.WakeLock? = null
   private var mediaServiceStarted = false
-  private var hasAudioFocus = false
   private val mediaHandler = Handler(Looper.getMainLooper())
   private val stopMediaService = Runnable {
     mediaServiceStarted = false
@@ -157,11 +155,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private val releaseInactiveMedia = Runnable {
     if (!mediaPlaying) releaseMedia()
   }
-  private var audioFocusRequest: AudioFocusRequest? = null
   private val artworkExecutor = Executors.newSingleThreadExecutor()
-  private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
-    if (change != AudioManager.AUDIOFOCUS_GAIN) controlMedia("pause")
-  }
 
   override fun load(webView: WebView) {
     shellWebView = webView
@@ -726,12 +720,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
         let active = null;
         let lastUpdate = 0;
+        const tracked = new WeakSet();
+        const handledEvents = new WeakSet();
         const absoluteUrl = (value) => {
           if (!value) return '';
           try { return new URL(value, location.href).href; } catch (_) { return ''; }
         };
         const send = (force = false) => {
-          if (!active || active.ended || !active.isConnected) {
+          if (!active || active.ended) {
             window.NetsanctumMedia?.postMessage(JSON.stringify({ active: false }));
             active = null;
             return;
@@ -757,8 +753,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           }));
         };
         const use = (event) => {
+          if (handledEvents.has(event)) return;
+          handledEvents.add(event);
           if (!(event.target instanceof HTMLMediaElement)) return;
-          if (event.type === 'play' || event.type === 'playing' || !active || active === event.target || active.ended || !active.isConnected) {
+          if (event.type === 'play' || event.type === 'playing' || !active || active === event.target || active.ended) {
             active = event.target;
           } else {
             return;
@@ -768,11 +766,37 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'ratechange', 'emptied']
           .forEach(name => document.addEventListener(name, use, true));
         document.addEventListener('timeupdate', use, true);
+        const trackDetached = (media) => {
+          if (tracked.has(media)) return;
+          tracked.add(media);
+          ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'ratechange', 'emptied', 'timeupdate']
+            .forEach(name => media.addEventListener(name, use));
+        };
+        const nativePlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function(...args) {
+          trackDetached(this);
+          return nativePlay.apply(this, args);
+        };
+        const NativeAudio = window.Audio;
+        window.Audio = new Proxy(NativeAudio, {
+          apply(target, receiver, args) {
+            const media = Reflect.apply(target, receiver, args);
+            trackDetached(media);
+            return media;
+          },
+          construct(target, args, newTarget) {
+            const media = Reflect.construct(target, args, newTarget);
+            trackDetached(media);
+            return media;
+          }
+        });
         window.__NETSANCTUM_MEDIA_CONTROL__ = (action, value) => {
           if (!active) active = [...document.querySelectorAll('audio,video')].find(item => !item.paused) || null;
           if (!active) return;
-          if (action === 'play') active.play().catch(() => {});
-          else if (action === 'pause') active.pause();
+          if (action === 'play') {
+            active.play().catch(() => {});
+            return;
+          } else if (action === 'pause') active.pause();
           else if (action === 'seek') active.currentTime = Math.max(0, Math.min(active.duration || Infinity, Number(value) || 0));
           else if (action === 'back') active.currentTime = Math.max(0, active.currentTime - 10);
           else if (action === 'forward') active.currentTime = Math.min(active.duration || Infinity, active.currentTime + 10);
@@ -1307,7 +1331,6 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       if (mediaWebView !== webView) return
       mediaPlaying = false
       updatePlaybackState()
-      abandonAudioFocus()
       releaseMediaWakeLock()
       publishMediaNotification()
       mediaHandler.removeCallbacks(releaseInactiveMedia)
@@ -1335,21 +1358,21 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     ensureMediaSession()
     updatePlaybackState()
     val artworkUrl = update.optString("artwork").trim()
-    if (artworkUrl != mediaArtworkUrl || (artworkUrl.isEmpty() && previousTitle != mediaTitle)) {
+    if (artworkUrl != mediaArtworkUrl) {
       mediaArtworkUrl = artworkUrl
+      mediaArtworkSource = null
       mediaArtwork = makeMediaArtwork(mediaTitle)
       updateMediaMetadata()
       if (artworkUrl.isNotEmpty()) loadMediaArtwork(webView, artworkUrl)
     } else {
+      if (previousTitle != mediaTitle) mediaArtwork = makeMediaArtwork(mediaTitle, mediaArtworkSource)
       updateMediaMetadata()
     }
 
     if (mediaPlaying) {
-      requestAudioFocus()
       acquireMediaWakeLock()
       startMediaService()
     } else {
-      abandonAudioFocus()
       releaseMediaWakeLock()
       mediaHandler.postDelayed(stopMediaService, MEDIA_PAUSE_GRACE_MS)
     }
@@ -1422,41 +1445,6 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     return true
   }
 
-  private fun requestAudioFocus() {
-    if (hasAudioFocus) return
-    val audioManager = activity.getSystemService(AudioManager::class.java)
-    val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-        .setAudioAttributes(
-          AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-            .build(),
-        )
-        .setOnAudioFocusChangeListener(audioFocusListener)
-        .setWillPauseWhenDucked(true)
-        .build()
-        .also { audioFocusRequest = it }
-      audioManager.requestAudioFocus(request)
-    } else {
-      @Suppress("DEPRECATION")
-      audioManager.requestAudioFocus(audioFocusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
-    }
-    hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-  }
-
-  private fun abandonAudioFocus() {
-    if (!hasAudioFocus) return
-    val audioManager = activity.getSystemService(AudioManager::class.java)
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      audioFocusRequest?.let(audioManager::abandonAudioFocusRequest)
-    } else {
-      @Suppress("DEPRECATION")
-      audioManager.abandonAudioFocus(audioFocusListener)
-    }
-    hasAudioFocus = false
-  }
-
   private fun acquireMediaWakeLock() {
     if (mediaWakeLock?.isHeld == true) return
     mediaWakeLock = (activity.getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -1498,6 +1486,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       @Suppress("DEPRECATION")
       Notification.Builder(activity)
     }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder.setColorized(true)
     val toggleAction = if (mediaPlaying) ACTION_MEDIA_PAUSE else ACTION_MEDIA_PLAY
     val toggleIcon = if (mediaPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
     return builder
@@ -1506,7 +1495,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       .setContentTitle(mediaTitle)
       .setContentText(mediaSubtitle)
       .setSubText("NETSANCTUM")
-      .setColor(Color.rgb(15, 185, 166))
+      .setColor(Color.rgb(5, 18, 16))
       .setCategory(Notification.CATEGORY_TRANSPORT)
       .setVisibility(Notification.VISIBILITY_PUBLIC)
       .setOnlyAlertOnce(true)
@@ -1587,7 +1576,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       if (bitmap != null) {
         activity.runOnUiThread {
           if (mediaWebView === webView && mediaArtworkUrl == artworkUrl) {
-            mediaArtwork = bitmap
+            mediaArtworkSource = bitmap
+            mediaArtwork = makeMediaArtwork(mediaTitle, bitmap)
             updateMediaMetadata()
             publishMediaNotification()
           }
@@ -1596,41 +1586,60 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
-  private fun makeMediaArtwork(title: String): Bitmap {
+  private fun makeMediaArtwork(title: String, source: Bitmap? = null): Bitmap {
     val size = 512
     val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    paint.shader = LinearGradient(
-      0f,
-      0f,
-      size.toFloat(),
-      size.toFloat(),
-      intArrayOf(Color.rgb(3, 18, 17), Color.rgb(13, 78, 70), Color.rgb(45, 212, 191)),
-      null,
-      Shader.TileMode.CLAMP,
-    )
-    canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), paint)
+    if (source != null) {
+      val sourceRatio = source.width.toFloat() / source.height
+      val targetRatio = 1f
+      val crop = if (sourceRatio > targetRatio) {
+        val width = (source.height * targetRatio).toInt()
+        Rect((source.width - width) / 2, 0, (source.width + width) / 2, source.height)
+      } else {
+        val height = (source.width / targetRatio).toInt()
+        Rect(0, (source.height - height) / 2, source.width, (source.height + height) / 2)
+      }
+      canvas.drawBitmap(source, crop, Rect(0, 0, size, size), paint)
+      paint.color = Color.argb(196, 2, 9, 8)
+      canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), paint)
+    } else {
+      paint.shader = LinearGradient(
+        0f,
+        0f,
+        size.toFloat(),
+        size.toFloat(),
+        intArrayOf(Color.rgb(2, 9, 8), Color.rgb(5, 24, 21), Color.rgb(9, 45, 39)),
+        null,
+        Shader.TileMode.CLAMP,
+      )
+      canvas.drawRect(0f, 0f, size.toFloat(), size.toFloat(), paint)
+    }
     paint.shader = null
     paint.style = Paint.Style.STROKE
-    paint.strokeWidth = 6f
-    paint.color = Color.argb(150, 153, 246, 228)
-    canvas.drawRect(28f, 28f, size - 28f, size - 28f, paint)
+    paint.strokeWidth = 8f
+    paint.color = Color.rgb(45, 212, 191)
+    canvas.drawRect(24f, 24f, size - 24f, size - 24f, paint)
     paint.style = Paint.Style.FILL
+    paint.color = Color.rgb(45, 212, 191)
+    canvas.drawRect(24f, 24f, 104f, 36f, paint)
+    canvas.drawRect(size - 36f, 24f, size - 24f, 132f, paint)
+    canvas.drawRect(24f, size - 42f, size - 148f, size - 24f, paint)
     paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-    paint.textAlign = Paint.Align.CENTER
+    paint.textAlign = Paint.Align.LEFT
     paint.color = Color.WHITE
-    paint.textSize = 76f
-    canvas.drawText("NS", size / 2f, 238f, paint)
+    paint.textSize = 64f
+    canvas.drawText("NS", 54f, 224f, paint)
     paint.color = Color.rgb(153, 246, 228)
-    paint.textSize = 22f
+    paint.textSize = 21f
     paint.letterSpacing = 0.18f
-    canvas.drawText("NETSANCTUM", size / 2f, 285f, paint)
+    canvas.drawText("NETSANCTUM", 58f, 266f, paint)
     paint.color = Color.argb(210, 229, 241, 238)
-    paint.textSize = 19f
+    paint.textSize = 18f
     paint.letterSpacing = 0.02f
-    val caption = title.uppercase(Locale.ROOT).replace(Regex("\\s+"), " ").take(34)
-    canvas.drawText(caption, size / 2f, 382f, paint)
+    val caption = title.uppercase(Locale.ROOT).replace(Regex("\\s+"), " ").take(32)
+    canvas.drawText(caption, 58f, 398f, paint)
     return bitmap
   }
 
@@ -1638,7 +1647,6 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (webView != null && mediaWebView !== webView) return
     mediaHandler.removeCallbacks(releaseInactiveMedia)
     mediaHandler.removeCallbacks(stopMediaService)
-    abandonAudioFocus()
     releaseMediaWakeLock()
     MediaPlaybackService.stopPlayback()
     activity.stopService(Intent(activity, MediaPlaybackService::class.java))
@@ -1650,6 +1658,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     mediaWebView = null
     mediaPlaying = false
     mediaArtwork = null
+    mediaArtworkSource = null
     mediaArtworkUrl = null
   }
 

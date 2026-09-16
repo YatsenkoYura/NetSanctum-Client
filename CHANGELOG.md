@@ -4,6 +4,17 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-09-16
+
+### Changed
+
+- Restyled Android media artwork with a dark matte background and turquoise neo-brutalist accents.
+
+### Fixed
+
+- Added Android media controls for detached and autoplaying audio players.
+- Prevented native audio focus handling from repeatedly pausing WebView video playback.
+
 ## [2.0.2] - 2026-09-16
 
 ### Added
