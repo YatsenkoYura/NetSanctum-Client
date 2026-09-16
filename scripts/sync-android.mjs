@@ -9,6 +9,11 @@ const target = resolve(
   androidProject,
   "src/main/java/dev/netsanctum/desktop/NodeViewPlugin.kt",
 );
+const activitySource = resolve(root, "src-tauri/android/MainActivity.kt");
+const activityTarget = resolve(
+  androidProject,
+  "src/main/java/dev/netsanctum/desktop/MainActivity.kt",
+);
 const networkSecuritySource = resolve(root, "src-tauri/android/network_security_config.xml");
 const networkSecurityTarget = resolve(androidProject, "src/main/res/xml/network_security_config.xml");
 const manifestPath = resolve(androidProject, "src/main/AndroidManifest.xml");
@@ -20,6 +25,7 @@ try {
 }
 await mkdir(dirname(target), { recursive: true });
 await copyFile(source, target);
+await copyFile(activitySource, activityTarget);
 await mkdir(dirname(networkSecurityTarget), { recursive: true });
 await copyFile(networkSecuritySource, networkSecurityTarget);
 
@@ -46,6 +52,12 @@ if (!manifest.includes("android:networkSecurityConfig")) {
   manifest = manifest.replace(
     'android:usesCleartextTraffic="${usesCleartextTraffic}">',
     'android:usesCleartextTraffic="${usesCleartextTraffic}"\n        android:networkSecurityConfig="@xml/network_security_config">',
+  );
+}
+if (!manifest.includes("android:supportsPictureInPicture")) {
+  manifest = manifest.replace(
+    'android:name=".MainActivity"',
+    'android:name=".MainActivity"\n            android:resizeableActivity="true"\n            android:supportsPictureInPicture="true"',
   );
 }
 await writeFile(manifestPath, manifest);

@@ -1,7 +1,7 @@
 {
   "name": "netsanctum-desktop",
   "private": true,
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Native client and offline runtime for NetSanctum",
   "license": "MPL-2.0",
   "repository": {
@@ -10,7 +10,7 @@
   },
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run sync:android && vite",
     "build": "npm run sync:android && svelte-check --tsconfig ./tsconfig.json && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "sync:android": "node scripts/sync-android.mjs",

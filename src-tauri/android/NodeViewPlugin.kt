@@ -2,11 +2,11 @@ package dev.netsanctum.desktop
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.Dialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.PictureInPictureParams
 import android.app.Service
 import android.Manifest
 import android.content.BroadcastReceiver
@@ -22,7 +22,6 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.media.MediaMetadata
@@ -39,11 +38,10 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.text.TextUtils
 import android.util.Base64
+import android.util.Rational
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
@@ -128,7 +126,10 @@ class VaultKeyArgs {
 @TauriPlugin
 class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var shellWebView: WebView? = null
-  private var activeNodeDialog: Dialog? = null
+  private var activeNodeContainer: FrameLayout? = null
+  private var closeActiveNodeView: (() -> Unit)? = null
+  private var handleActiveNodeBack: (() -> Boolean)? = null
+  private var setActiveNodePipMode: ((Boolean) -> Unit)? = null
   private var notificationPermissionRequested = false
   private var pendingShortcutNode: String? = null
   private var pendingShortcutModule: String? = null
@@ -142,6 +143,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var mediaArtworkSource: Bitmap? = null
   private var mediaArtworkUrl: String? = null
   private var mediaPlaying = false
+  private var mediaIsVideo = false
+  private var mediaBackgroundAllowed = true
+  private var mediaVideoWidth = 16
+  private var mediaVideoHeight = 9
   private var mediaPositionMs = 0L
   private var mediaDurationMs = -1L
   private var mediaPlaybackRate = 1f
@@ -168,7 +173,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (handleMediaIntent(intent.action)) return
     captureShortcut(intent)
     activity.runOnUiThread {
-      activeNodeDialog?.dismiss()
+      closeActiveNodeView?.invoke()
       dispatchPendingShortcut()
     }
   }
@@ -315,11 +320,13 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     activity.runOnUiThread {
-      activeNodeDialog?.dismiss()
-      val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_NoActionBar)
-      activeNodeDialog = dialog
+      closeActiveNodeView?.invoke()
+      val activityContent = activity.findViewById<ViewGroup>(android.R.id.content)
       val container = FrameLayout(activity).apply {
         setBackgroundColor(Color.BLACK)
+        isClickable = true
+        isFocusable = true
+        elevation = dp(16).toFloat()
       }
       val content = LinearLayout(activity).apply {
         orientation = LinearLayout.VERTICAL
@@ -384,21 +391,20 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       var customViewCallback: WebChromeClient.CustomViewCallback? = null
       var isFullscreen = false
       lateinit var nodeWebChromeClient: WebChromeClient
+      var closeNode: (() -> Unit)? = null
 
       fun hideSystemBars() {
-        dialog.window?.let { window ->
-          val controller = WindowCompat.getInsetsController(window, window.decorView)
-          controller.hide(WindowInsetsCompat.Type.systemBars())
-          controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
+        val window = activity.window
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+          WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
       }
 
       fun showSystemBars() {
-        dialog.window?.let { window ->
-          val controller = WindowCompat.getInsetsController(window, window.decorView)
-          controller.show(WindowInsetsCompat.Type.systemBars())
-        }
+        val window = activity.window
+        WindowCompat.getInsetsController(window, window.decorView)
+          .show(WindowInsetsCompat.Type.systemBars())
       }
 
       ViewCompat.setOnApplyWindowInsetsListener(container) { _, insets ->
@@ -420,14 +426,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         insets
       }
 
-      homeButton.setOnClickListener { dialog.dismiss() }
+      homeButton.setOnClickListener { closeNode?.invoke() }
       backButton.setOnClickListener {
         if (customView != null) {
           nodeWebChromeClient.onHideCustomView()
         } else if (webView.canGoBack()) {
           webView.goBack()
         } else {
-          dialog.dismiss()
+          closeNode?.invoke()
         }
       }
       settingsButton.setOnClickListener {
@@ -457,6 +463,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       val preferences = activity.getSharedPreferences("netsanctum_ui", Activity.MODE_PRIVATE)
       webView.settings.textZoom = preferences.getInt("text_zoom", 100)
       webView.keepScreenOn = preferences.getBoolean("keep_screen_on", false)
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+      }
       val mediaOrigin = "${nodeUri.scheme}://${nodeUri.encodedAuthority}"
       installMediaMessageListener(webView, nodeUri, args.moduleTitle, mediaOrigin)
       if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
@@ -648,44 +657,47 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       )
       cookies.flush()
 
-      dialog.setContentView(container)
-      dialog.setOnKeyListener { _, keyCode, event ->
-        if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
-          false
-        } else if (customView != null) {
+      val handleBack = {
+        if (customView != null) {
           nodeWebChromeClient.onHideCustomView()
-          true
         } else if (webView.canGoBack()) {
           webView.goBack()
-          true
         } else {
-          dialog.dismiss()
-          true
+          closeNode?.invoke()
         }
+        true
       }
-      dialog.setOnDismissListener {
+      closeNode = closeNode@{
+        if (activeNodeContainer !== container) return@closeNode
+        activeNodeContainer = null
+        closeActiveNodeView = null
+        handleActiveNodeBack = null
+        setActiveNodePipMode = null
         if (customView != null) {
           nodeWebChromeClient.onHideCustomView()
         }
         cookies.setCookie(args.nodeUrl, "${args.cookieName}=; Path=/; Max-Age=0$secure")
         releaseMedia(webView)
         webView.stopLoading()
+        (container.parent as? ViewGroup)?.removeView(container)
         webView.destroy()
-        if (activeNodeDialog === dialog) activeNodeDialog = null
+        showSystemBars()
       }
-      dialog.show()
-      dialog.window?.let { window ->
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.setLayout(
+      activeNodeContainer = container
+      closeActiveNodeView = closeNode
+      handleActiveNodeBack = handleBack
+      setActiveNodePipMode = { inPip ->
+        toolbar.visibility = if (inPip) View.GONE else View.VISIBLE
+        if (inPip || isFullscreen) hideSystemBars() else showSystemBars()
+        webView.evaluateJavascript("window.__NETSANCTUM_SET_PIP_MODE__?.($inPip)", null)
+      }
+      activityContent.addView(
+        container,
+        ViewGroup.LayoutParams(
           ViewGroup.LayoutParams.MATCH_PARENT,
           ViewGroup.LayoutParams.MATCH_PARENT,
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-          window.attributes.layoutInDisplayCutoutMode =
-            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        }
-        window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
-      }
+        ),
+      )
       ViewCompat.requestApplyInsets(container)
       webView.loadUrl(args.nodeUrl)
     }
@@ -720,6 +732,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
         let active = null;
         let lastUpdate = 0;
+        let pipMode = false;
+        let pipVideo = null;
         const tracked = new WeakSet();
         const handledEvents = new WeakSet();
         const absoluteUrl = (value) => {
@@ -749,9 +763,55 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
             artwork: absoluteUrl(artwork),
             position: Number.isFinite(active.currentTime) ? active.currentTime : 0,
             duration: Number.isFinite(active.duration) ? active.duration : -1,
-            playbackRate: Number.isFinite(active.playbackRate) ? active.playbackRate : 1
+            playbackRate: Number.isFinite(active.playbackRate) ? active.playbackRate : 1,
+            kind: active instanceof HTMLVideoElement ? 'video' : 'audio',
+            videoWidth: active instanceof HTMLVideoElement ? active.videoWidth : 0,
+            videoHeight: active instanceof HTMLVideoElement ? active.videoHeight : 0,
+            backgroundAllowed: !!window.__NETSANCTUM_BACKGROUND_MEDIA__
           }));
         };
+        const setPipMode = (enabled) => {
+          pipMode = enabled;
+          pipVideo?.removeAttribute('data-netsanctum-pip-video');
+          pipVideo = null;
+          document.documentElement.toggleAttribute('data-netsanctum-pip', enabled);
+          if (!enabled) return true;
+          const video = active instanceof HTMLVideoElement
+            ? active
+            : [...document.querySelectorAll('video')].find(item => !item.paused && !item.ended);
+          if (!video) {
+            document.documentElement.removeAttribute('data-netsanctum-pip');
+            pipMode = false;
+            return false;
+          }
+          let style = document.getElementById('netsanctum-pip-style');
+          if (!style) {
+            style = document.createElement('style');
+            style.id = 'netsanctum-pip-style';
+            style.textContent = `
+              html[data-netsanctum-pip], html[data-netsanctum-pip] body {
+                overflow: hidden !important;
+                background: #000 !important;
+              }
+              video[data-netsanctum-pip-video] {
+                position: fixed !important;
+                inset: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                max-width: none !important;
+                max-height: none !important;
+                object-fit: contain !important;
+                background: #000 !important;
+                z-index: 2147483647 !important;
+              }
+            `;
+            (document.head || document.documentElement).appendChild(style);
+          }
+          pipVideo = video;
+          pipVideo.setAttribute('data-netsanctum-pip-video', '');
+          return true;
+        };
+        window.__NETSANCTUM_SET_PIP_MODE__ = setPipMode;
         const use = (event) => {
           if (handledEvents.has(event)) return;
           handledEvents.add(event);
@@ -761,6 +821,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           } else {
             return;
           }
+          if (pipMode && active instanceof HTMLVideoElement && active !== pipVideo) setPipMode(true);
           send(true);
         };
         ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'ratechange', 'emptied']
@@ -1330,6 +1391,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (!update.optBoolean("active")) {
       if (mediaWebView !== webView) return
       mediaPlaying = false
+      mediaIsVideo = false
       updatePlaybackState()
       releaseMediaWakeLock()
       publishMediaNotification()
@@ -1342,6 +1404,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     val previousTitle = mediaTitle
     mediaWebView = webView
     mediaPlaying = update.optBoolean("playing")
+    mediaIsVideo = update.optString("kind") == "video"
+    mediaBackgroundAllowed = update.optBoolean("backgroundAllowed", true)
+    mediaVideoWidth = update.optInt("videoWidth", 16).coerceAtLeast(1)
+    mediaVideoHeight = update.optInt("videoHeight", 9).coerceAtLeast(1)
     mediaTitle = update.optString("title").trim().take(256).ifEmpty { moduleTitle.ifEmpty { "Netsanctum Client" } }
     mediaSubtitle = update.optString("artist").trim().take(256)
       .ifEmpty { update.optString("album").trim().take(256) }
@@ -1657,10 +1723,48 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     mediaSession = null
     mediaWebView = null
     mediaPlaying = false
+    mediaIsVideo = false
     mediaArtwork = null
     mediaArtworkSource = null
     mediaArtworkUrl = null
   }
+
+  private fun enterPictureInPicture() {
+    if (
+      Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+      !mediaPlaying ||
+      !mediaIsVideo ||
+      !mediaBackgroundAllowed ||
+      activeNodeContainer == null ||
+      activity.isFinishing ||
+      activity.isInPictureInPictureMode
+    ) {
+      return
+    }
+    val aspectRatio = when {
+      mediaVideoWidth.toDouble() / mediaVideoHeight < 100.0 / 239.0 -> Rational(100, 239)
+      mediaVideoWidth.toDouble() / mediaVideoHeight > 239.0 / 100.0 -> Rational(239, 100)
+      else -> Rational(mediaVideoWidth, mediaVideoHeight)
+    }
+    val params = PictureInPictureParams.Builder()
+      .setAspectRatio(aspectRatio)
+      .build()
+    val setPipMode = setActiveNodePipMode ?: return
+    setPipMode(true)
+    try {
+      if (!activity.enterPictureInPictureMode(params)) setPipMode(false)
+    } catch (_: IllegalArgumentException) {
+      setPipMode(false)
+    } catch (_: IllegalStateException) {
+      setPipMode(false)
+    }
+  }
+
+  private fun pictureInPictureModeChanged(inPictureInPictureMode: Boolean) {
+    setActiveNodePipMode?.invoke(inPictureInPictureMode)
+  }
+
+  private fun handleBackPressed(): Boolean = handleActiveNodeBack?.invoke() ?: false
 
   private fun dp(value: Int): Int =
     (value * activity.resources.displayMetrics.density).toInt()
@@ -1762,6 +1866,24 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
     internal fun mediaServiceStopped() {
       activePlugin?.get()?.mediaServiceStarted = false
+    }
+
+    internal fun enterPictureInPicture() {
+      activePlugin?.get()?.enterPictureInPicture()
+    }
+
+    internal fun pictureInPictureModeChanged(inPictureInPictureMode: Boolean) {
+      activePlugin?.get()?.pictureInPictureModeChanged(inPictureInPictureMode)
+    }
+
+    internal fun handleBackPressed(): Boolean =
+      activePlugin?.get()?.handleBackPressed() ?: false
+
+    internal fun activityDestroyed(destroyedActivity: Activity) {
+      val plugin = activePlugin?.get()?.takeIf { it.activity === destroyedActivity } ?: return
+      val closeNode = plugin.closeActiveNodeView
+      if (closeNode != null) closeNode() else plugin.releaseMedia()
+      activePlugin = null
     }
   }
 
