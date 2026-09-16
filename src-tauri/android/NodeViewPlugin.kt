@@ -123,6 +123,19 @@ class VaultKeyArgs {
   lateinit var value: String
 }
 
+private class BackgroundMediaWebView(context: Context) : WebView(context) {
+  var preserveMediaWhenHidden = true
+
+  override fun onWindowVisibilityChanged(visibility: Int) {
+    val effectiveVisibility = if (preserveMediaWhenHidden && visibility != View.VISIBLE) {
+      View.VISIBLE
+    } else {
+      visibility
+    }
+    super.onWindowVisibilityChanged(effectiveVisibility)
+  }
+}
+
 @TauriPlugin
 class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var shellWebView: WebView? = null
@@ -147,6 +160,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   private var mediaBackgroundAllowed = true
   private var mediaVideoWidth = 16
   private var mediaVideoHeight = 9
+  private var activityPaused = false
+  private var backgroundPlaybackExpected = false
+  private var backgroundResumeAttempts = 0
   private var mediaPositionMs = 0L
   private var mediaDurationMs = -1L
   private var mediaPlaybackRate = 1f
@@ -159,6 +175,20 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
   }
   private val releaseInactiveMedia = Runnable {
     if (!mediaPlaying) releaseMedia()
+  }
+  private val resumeBackgroundMedia = object : Runnable {
+    override fun run() {
+      if (
+        activityPaused &&
+        backgroundPlaybackExpected &&
+        mediaBackgroundAllowed &&
+        backgroundResumeAttempts > 0
+      ) {
+        backgroundResumeAttempts -= 1
+        controlMedia("play")
+        if (backgroundResumeAttempts > 0) mediaHandler.postDelayed(this, 1_000)
+      }
+    }
   }
   private val artworkExecutor = Executors.newSingleThreadExecutor()
 
@@ -342,7 +372,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         setPadding(dp(4), 0, dp(4), 0)
         setBackgroundColor(Color.rgb(5, 8, 7))
       }
-      val webView = WebView(activity)
+      val webView = BackgroundMediaWebView(activity)
       webView.setBackgroundColor(Color.BLACK)
       val homeButton = toolbarButton("NC")
       val backButton = toolbarButton("<")
@@ -463,6 +493,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       val preferences = activity.getSharedPreferences("netsanctum_ui", Activity.MODE_PRIVATE)
       webView.settings.textZoom = preferences.getInt("text_zoom", 100)
       webView.keepScreenOn = preferences.getBoolean("keep_screen_on", false)
+      webView.preserveMediaWhenHidden = preferences.getBoolean("background_media", true)
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
       }
@@ -855,7 +886,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
           if (!active) active = [...document.querySelectorAll('audio,video')].find(item => !item.paused) || null;
           if (!active) return;
           if (action === 'play') {
-            active.play().catch(() => {});
+            active.play().then(() => send(true)).catch(() => send(true));
             return;
           } else if (action === 'pause') active.pause();
           else if (action === 'seek') active.currentTime = Math.max(0, Math.min(active.duration || Infinity, Number(value) || 0));
@@ -1026,6 +1057,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         index == scales.size + 1 -> {
           val enabled = !backgroundMedia
           preferences.edit().putBoolean("background_media", enabled).apply()
+          (webView as? BackgroundMediaWebView)?.preserveMediaWhenHidden = enabled
+          if (mediaWebView === webView) mediaBackgroundAllowed = enabled
           webView.evaluateJavascript(
             "window.__NETSANCTUM_BACKGROUND_MEDIA__=${if (enabled) "true" else "false"}",
             null,
@@ -1392,6 +1425,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       if (mediaWebView !== webView) return
       mediaPlaying = false
       mediaIsVideo = false
+      backgroundPlaybackExpected = false
+      backgroundResumeAttempts = 0
+      mediaHandler.removeCallbacks(resumeBackgroundMedia)
       updatePlaybackState()
       releaseMediaWakeLock()
       publishMediaNotification()
@@ -1403,9 +1439,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     mediaHandler.removeCallbacks(stopMediaService)
     val previousTitle = mediaTitle
     mediaWebView = webView
-    mediaPlaying = update.optBoolean("playing")
+    val reportedPlaying = update.optBoolean("playing")
     mediaIsVideo = update.optString("kind") == "video"
     mediaBackgroundAllowed = update.optBoolean("backgroundAllowed", true)
+    val shouldResumeInBackground = activityPaused &&
+      backgroundPlaybackExpected &&
+      mediaBackgroundAllowed &&
+      backgroundResumeAttempts > 0
+    mediaPlaying = reportedPlaying || shouldResumeInBackground
     mediaVideoWidth = update.optInt("videoWidth", 16).coerceAtLeast(1)
     mediaVideoHeight = update.optInt("videoHeight", 9).coerceAtLeast(1)
     mediaTitle = update.optString("title").trim().take(256).ifEmpty { moduleTitle.ifEmpty { "Netsanctum Client" } }
@@ -1449,9 +1490,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (mediaSession != null) return
     mediaSession = MediaSession(activity, "NetsanctumMedia").apply {
       setCallback(object : MediaSession.Callback() {
-        override fun onPlay() = controlMedia("play")
-        override fun onPause() = controlMedia("pause")
-        override fun onStop() = controlMedia("pause")
+        override fun onPlay() = requestMediaPlay()
+        override fun onPause() = requestMediaPause()
+        override fun onStop() = requestMediaPause()
         override fun onSeekTo(position: Long) = controlMedia("seek", position / 1_000.0)
         override fun onRewind() = controlMedia("back")
         override fun onFastForward() = controlMedia("forward")
@@ -1493,6 +1534,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     val webView = mediaWebView ?: return
     val argument = value?.toString() ?: "null"
     webView.post {
+      if (mediaWebView !== webView) return@post
       webView.evaluateJavascript(
         "window.__NETSANCTUM_MEDIA_CONTROL__?.(${org.json.JSONObject.quote(action)},$argument)",
         null,
@@ -1502,13 +1544,30 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
   private fun handleMediaIntent(action: String?): Boolean {
     when (action) {
-      ACTION_MEDIA_PLAY -> controlMedia("play")
-      ACTION_MEDIA_PAUSE -> controlMedia("pause")
+      ACTION_MEDIA_PLAY -> requestMediaPlay()
+      ACTION_MEDIA_PAUSE -> requestMediaPause()
       ACTION_MEDIA_BACK -> controlMedia("back")
       ACTION_MEDIA_FORWARD -> controlMedia("forward")
       else -> return false
     }
     return true
+  }
+
+  private fun requestMediaPlay() {
+    if (activityPaused && mediaBackgroundAllowed) {
+      backgroundPlaybackExpected = true
+      backgroundResumeAttempts = BACKGROUND_RESUME_ATTEMPTS
+      scheduleBackgroundResume()
+    }
+    controlMedia("play")
+  }
+
+  private fun requestMediaPause() {
+    mediaPlaying = false
+    backgroundPlaybackExpected = false
+    backgroundResumeAttempts = 0
+    mediaHandler.removeCallbacks(resumeBackgroundMedia)
+    controlMedia("pause")
   }
 
   private fun acquireMediaWakeLock() {
@@ -1713,6 +1772,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     if (webView != null && mediaWebView !== webView) return
     mediaHandler.removeCallbacks(releaseInactiveMedia)
     mediaHandler.removeCallbacks(stopMediaService)
+    mediaHandler.removeCallbacks(resumeBackgroundMedia)
     releaseMediaWakeLock()
     MediaPlaybackService.stopPlayback()
     activity.stopService(Intent(activity, MediaPlaybackService::class.java))
@@ -1724,6 +1784,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     mediaWebView = null
     mediaPlaying = false
     mediaIsVideo = false
+    backgroundPlaybackExpected = false
+    backgroundResumeAttempts = 0
     mediaArtwork = null
     mediaArtworkSource = null
     mediaArtworkUrl = null
@@ -1762,6 +1824,27 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
   private fun pictureInPictureModeChanged(inPictureInPictureMode: Boolean) {
     setActiveNodePipMode?.invoke(inPictureInPictureMode)
+  }
+
+  private fun activityPaused() {
+    activityPaused = true
+    backgroundPlaybackExpected = mediaPlaying && mediaBackgroundAllowed
+    backgroundResumeAttempts = if (backgroundPlaybackExpected) BACKGROUND_RESUME_ATTEMPTS else 0
+    if (backgroundPlaybackExpected) scheduleBackgroundResume()
+  }
+
+  private fun activityResumed() {
+    activityPaused = false
+    mediaHandler.removeCallbacks(resumeBackgroundMedia)
+    if (backgroundPlaybackExpected) controlMedia("play")
+    backgroundPlaybackExpected = false
+    backgroundResumeAttempts = 0
+  }
+
+  private fun scheduleBackgroundResume() {
+    mediaHandler.removeCallbacks(resumeBackgroundMedia)
+    mediaWebView?.onResume()
+    mediaHandler.postDelayed(resumeBackgroundMedia, 250)
   }
 
   private fun handleBackPressed(): Boolean = handleActiveNodeBack?.invoke() ?: false
@@ -1844,6 +1927,7 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     private const val MAX_ARTWORK_BYTES = 8 * 1024 * 1024
     private const val MEDIA_TRANSITION_GRACE_MS = 30_000L
     private const val MEDIA_PAUSE_GRACE_MS = 30_000L
+    private const val BACKGROUND_RESUME_ATTEMPTS = 3
     internal const val ACTION_MEDIA_PLAY = "dev.netsanctum.desktop.MEDIA_PLAY"
     internal const val ACTION_MEDIA_PAUSE = "dev.netsanctum.desktop.MEDIA_PAUSE"
     internal const val ACTION_MEDIA_BACK = "dev.netsanctum.desktop.MEDIA_BACK"
@@ -1878,6 +1962,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
 
     internal fun handleBackPressed(): Boolean =
       activePlugin?.get()?.handleBackPressed() ?: false
+
+    internal fun activityPaused() {
+      activePlugin?.get()?.activityPaused()
+    }
+
+    internal fun activityResumed() {
+      activePlugin?.get()?.activityResumed()
+    }
 
     internal fun activityDestroyed(destroyedActivity: Activity) {
       val plugin = activePlugin?.get()?.takeIf { it.activity === destroyedActivity } ?: return

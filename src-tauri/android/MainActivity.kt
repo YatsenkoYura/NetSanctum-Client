@@ -24,6 +24,16 @@ class MainActivity : TauriActivity() {
     super.onUserLeaveHint()
   }
 
+  override fun onPause() {
+    NodeViewPlugin.activityPaused()
+    super.onPause()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    NodeViewPlugin.activityResumed()
+  }
+
   override fun onPictureInPictureModeChanged(
     isInPictureInPictureMode: Boolean,
     newConfig: Configuration,

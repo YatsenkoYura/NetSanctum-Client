@@ -4,6 +4,13 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.0.5] - 2026-09-16
+
+### Fixed
+
+- Prevented Android WebView from suspending active module media when the screen is locked.
+- Retried interrupted background video playback without overriding system media pause commands.
+
 ## [2.0.4] - 2026-09-16
 
 ### Added
