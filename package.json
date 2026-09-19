@@ -20,13 +20,13 @@
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
-    "svelte": "5.56.9"
+    "svelte": "5.57.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.0",
     "@tauri-apps/cli": "2.11.4",
-    "svelte-check": "4.7.5",
-    "typescript": "6.0.3",
-    "vite": "8.2.1"
+    "svelte-check": "4.7.6",
+    "typescript": "7.0.2",
+    "vite": "8.3.0"
   }
 }
