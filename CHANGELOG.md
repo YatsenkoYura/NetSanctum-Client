@@ -4,6 +4,13 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.0.6] - 2026-09-19
+
+### Fixed
+
+- Routed headset and system previous/next commands to the active NetSanctum module player.
+- Refreshed Android media metadata immediately when tracks, videos, or episodes change.
+
 ## [2.0.5] - 2026-09-16
 
 ### Fixed

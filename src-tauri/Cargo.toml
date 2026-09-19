@@ -1,6 +1,6 @@
 [package]
 name = "netsanctum-desktop"
-version = "2.0.5"
+version = "2.0.6"
 description = "Secure offline client companion for NetSanctum"
 authors = ["NetSanctum contributors"]
 edition = "2024"

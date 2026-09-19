@@ -858,6 +858,18 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         ['play', 'playing', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'ratechange', 'emptied']
           .forEach(name => document.addEventListener(name, use, true));
         document.addEventListener('timeupdate', use, true);
+        document.addEventListener('netsanctum:mediachange', (event) => {
+          const media = event.detail?.media;
+          if (event.detail?.active === false) {
+            if (!media || active === media) {
+              window.NetsanctumMedia?.postMessage(JSON.stringify({ active: false }));
+              active = null;
+            }
+            return;
+          }
+          if (media instanceof HTMLMediaElement) active = media;
+          send(true);
+        }, true);
         const trackDetached = (media) => {
           if (tracked.has(media)) return;
           tracked.add(media);
@@ -885,6 +897,10 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         window.__NETSANCTUM_MEDIA_CONTROL__ = (action, value) => {
           if (!active) active = [...document.querySelectorAll('audio,video')].find(item => !item.paused) || null;
           if (!active) return;
+          if (window.__NETSANCTUM_MEDIA_ACTION__?.(action, value)) {
+            setTimeout(() => send(true), 0);
+            return;
+          }
           if (action === 'play') {
             active.play().then(() => send(true)).catch(() => send(true));
             return;
@@ -1496,6 +1512,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         override fun onSeekTo(position: Long) = controlMedia("seek", position / 1_000.0)
         override fun onRewind() = controlMedia("back")
         override fun onFastForward() = controlMedia("forward")
+        override fun onSkipToNext() = controlMedia("nexttrack")
+        override fun onSkipToPrevious() = controlMedia("previoustrack")
       })
       setSessionActivity(contentIntent())
       isActive = true
@@ -1509,6 +1527,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       PlaybackState.ACTION_SEEK_TO or
       PlaybackState.ACTION_REWIND or
       PlaybackState.ACTION_FAST_FORWARD or
+      PlaybackState.ACTION_SKIP_TO_NEXT or
+      PlaybackState.ACTION_SKIP_TO_PREVIOUS or
       PlaybackState.ACTION_STOP
     val state = if (mediaPlaying) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
     mediaSession?.setPlaybackState(
@@ -1548,6 +1568,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       ACTION_MEDIA_PAUSE -> requestMediaPause()
       ACTION_MEDIA_BACK -> controlMedia("back")
       ACTION_MEDIA_FORWARD -> controlMedia("forward")
+      ACTION_MEDIA_PREVIOUS -> controlMedia("previoustrack")
+      ACTION_MEDIA_NEXT -> controlMedia("nexttrack")
       else -> return false
     }
     return true
@@ -1627,9 +1649,9 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
       .setShowWhen(false)
       .setOngoing(mediaPlaying)
       .setContentIntent(contentIntent())
-      .addAction(notificationAction(android.R.drawable.ic_media_rew, "Назад 10 с", ACTION_MEDIA_BACK, 1))
+      .addAction(notificationAction(android.R.drawable.ic_media_previous, "Предыдущий", ACTION_MEDIA_PREVIOUS, 1))
       .addAction(notificationAction(toggleIcon, if (mediaPlaying) "Пауза" else "Играть", toggleAction, 2))
-      .addAction(notificationAction(android.R.drawable.ic_media_ff, "Вперёд 10 с", ACTION_MEDIA_FORWARD, 3))
+      .addAction(notificationAction(android.R.drawable.ic_media_next, "Следующий", ACTION_MEDIA_NEXT, 3))
       .setStyle(
         Notification.MediaStyle()
           .setMediaSession(mediaSession?.sessionToken)
@@ -1932,6 +1954,8 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
     internal const val ACTION_MEDIA_PAUSE = "dev.netsanctum.desktop.MEDIA_PAUSE"
     internal const val ACTION_MEDIA_BACK = "dev.netsanctum.desktop.MEDIA_BACK"
     internal const val ACTION_MEDIA_FORWARD = "dev.netsanctum.desktop.MEDIA_FORWARD"
+    internal const val ACTION_MEDIA_PREVIOUS = "dev.netsanctum.desktop.MEDIA_PREVIOUS"
+    internal const val ACTION_MEDIA_NEXT = "dev.netsanctum.desktop.MEDIA_NEXT"
     private const val ACTION_OPEN_SMART_MODULE = "dev.netsanctum.desktop.OPEN_SMART_MODULE"
     private const val LEGACY_ACTION_OPEN_OFFLINE_MODULE = "dev.netsanctum.desktop.OPEN_OFFLINE_MODULE"
     private const val EXTRA_NODE_ORIGIN = "node_origin"
