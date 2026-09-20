@@ -27,12 +27,30 @@ pub fn write(path: &Path, bytes: &[u8]) -> AppResult<()> {
         .map_err(|error| AppError::Storage(error.to_string()))?;
     temporary
         .persist(path)
-        .map(|_| ())
-        .map_err(|error| AppError::Storage(error.error.to_string()))
+        .map_err(|error| AppError::Storage(error.error.to_string()))?;
+    sync_directory(parent)
 }
 
 pub async fn write_async(path: PathBuf, bytes: Vec<u8>) -> AppResult<()> {
     tokio::task::spawn_blocking(move || write(&path, &bytes))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+}
+
+#[cfg(unix)]
+pub fn sync_directory(path: &Path) -> AppResult<()> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AppError::Storage(error.to_string()))
+}
+
+#[cfg(not(unix))]
+pub fn sync_directory(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
+pub async fn sync_directory_async(path: PathBuf) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || sync_directory(&path))
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?
 }

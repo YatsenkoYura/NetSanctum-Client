@@ -72,6 +72,11 @@ If the versioned endpoint is absent, Desktop falls back to the existing cookie e
 
 ## Package manifest v1
 
+The canonical producer and synchronization contract is defined in
+`NetSanctum/OFFLINE_PACKAGE_MANIFEST_STANDARD.md`. This section summarizes the client-facing wire
+format; implementations must follow the full snapshot, atomic replacement, shared-object, failure,
+and concurrency semantics in that standard.
+
 Every offline-capable module provides explicit metadata. Desktop code must never infer a module from URL segments.
 
 ```json
@@ -104,6 +109,10 @@ Every offline-capable module provides explicit metadata. Desktop code must never
 
 Resource URLs must be same-origin relative URLs. Downloads reject redirects to another origin. When manifests provide expected sizes and hashes, the client verifies them in addition to always calculating a local SHA-256 content address. Hard resource and package limits protect the device when legacy manifests omit those fields.
 
+Refresh and delete requests receive process-local monotonic operation numbers. After a manifest is
+validated, its number is registered against `(node_origin, package_id)` so an older refresh cannot
+publish over a newer refresh or a later delete. Exact duplicate manifest URLs remain coalesced.
+
 ## Storage
 
 - SQLite stores metadata and resource references.
@@ -116,6 +125,7 @@ Resource URLs must be same-origin relative URLs. Downloads reject redirects to a
 ## Current limitations
 
 - Releases are not yet code-signed or notarized.
-- The application is not yet single-instance.
-- Updating an already-ready package is not generation-based yet; a failed replacement can leave that package marked failed until it is downloaded again.
+- The application is not yet single-instance; package-operation sequencing and object-store locking
+  are process-local, so multiple processes must not share one application data directory.
+- Package updates stage a complete resource set and replace SQLite references in one transaction; filesystem and SQLite commits cannot be made as one cross-system transaction.
 - The Linux Tauri stack currently carries upstream gtk-rs maintenance and soundness advisories tracked in `README.md` and CI output.

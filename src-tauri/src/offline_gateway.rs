@@ -429,7 +429,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::{OfflineSession, Runtime, Segment, parse_range, resolve_resource};
-    use crate::library::Library;
+    use crate::library::{Library, PackageReplacement, ResourceRecord};
 
     #[test]
     fn parses_media_ranges() {
@@ -446,47 +446,33 @@ mod tests {
     fn skips_missing_resource_and_uses_next_package() {
         let directory = tempfile::tempdir().unwrap();
         let library = Arc::new(Library::open(directory.path()).unwrap());
-        for package_id in ["missing", "available"] {
-            library
-                .begin_package(
-                    "https://node.example",
-                    "media",
-                    "Media",
-                    "/media",
-                    package_id,
-                    package_id,
-                    "/media",
-                    "1",
-                )
-                .unwrap();
-        }
         let missing = directory.path().join("missing.bin");
         let available = directory.path().join("available.bin");
         std::fs::write(&available, b"media").unwrap();
-        library
-            .record_resource(
-                "https://node.example",
-                "missing",
-                "/media/file",
-                "file",
-                missing.to_str().unwrap(),
-                Some("audio/mpeg"),
-                5,
-                "missing",
-            )
-            .unwrap();
-        library
-            .record_resource(
-                "https://node.example",
-                "available",
-                "/media/file",
-                "file",
-                available.to_str().unwrap(),
-                Some("audio/mpeg"),
-                5,
-                "available",
-            )
-            .unwrap();
+        for (package_id, path) in [("missing", &missing), ("available", &available)] {
+            let resources = [ResourceRecord {
+                resource_url: "/media/file".into(),
+                resource_type: "file".into(),
+                local_path: path.to_str().unwrap().into(),
+                mime_type: Some("audio/mpeg".into()),
+                byte_size: 5,
+                sha256: package_id.into(),
+            }];
+            library
+                .replace_package(&PackageReplacement {
+                    node_origin: "https://node.example",
+                    module_id: "media",
+                    module_title: "Media",
+                    module_root_url: "/media",
+                    package_id,
+                    package_title: package_id,
+                    root_url: "/media",
+                    saved_at: "1",
+                    byte_size: 5,
+                    resources: &resources,
+                })
+                .unwrap();
+        }
         let runtime = Runtime {
             library,
             session: RwLock::new(None),

@@ -31,6 +31,8 @@ pub enum AppError {
     InvalidPackage(String),
     #[error("Не удалось скачать offline package: {0}")]
     Download(String),
+    #[error("Offline package operation was superseded by a newer request")]
+    OperationSuperseded,
     #[error("Requested byte range is not satisfiable")]
     RangeNotSatisfiable,
     #[error("Ошибка локального хранилища: {0}")]

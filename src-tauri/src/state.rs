@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +79,9 @@ pub struct AppState {
     master_token: Mutex<Option<Zeroizing<String>>>,
     data_dir: PathBuf,
     active_downloads: Mutex<HashSet<String>>,
+    operation_sequence: AtomicU64,
+    package_operations: Mutex<HashMap<(String, String), u64>>,
+    object_store: tokio::sync::Mutex<()>,
     offline_gateway: tokio::sync::OnceCell<crate::offline_gateway::OfflineGateway>,
     active_view: Mutex<ActiveView>,
     session_generation: AtomicU64,
@@ -104,16 +107,21 @@ impl AppState {
         let config_store = ConfigStore::new(data_dir);
         let config = config_store.load()?;
         let credentials = CredentialStore::new(data_dir);
+        let library = Arc::new(Library::open(data_dir)?);
+        crate::downloads::gc_unreferenced_objects(data_dir, &library);
         Ok(Self {
             config_store,
             credentials,
             node_client: NodeClient::new()?,
-            library: Arc::new(Library::open(data_dir)?),
+            library,
             config: Mutex::new(config),
             session: Mutex::new(None),
             master_token: Mutex::new(None),
             data_dir: data_dir.to_owned(),
             active_downloads: Mutex::new(HashSet::new()),
+            operation_sequence: AtomicU64::new(1),
+            package_operations: Mutex::new(HashMap::new()),
+            object_store: tokio::sync::Mutex::new(()),
             offline_gateway: tokio::sync::OnceCell::new(),
             active_view: Mutex::new(ActiveView::Desktop),
             session_generation: AtomicU64::new(1),
@@ -365,12 +373,17 @@ impl AppState {
         self.tray_available.load(Ordering::SeqCst)
     }
 
-    pub fn reserve_download(&self, manifest_url: &str) -> AppResult<bool> {
-        Ok(self
+    pub fn reserve_download(&self, manifest_url: &str) -> AppResult<Option<u64>> {
+        let mut downloads = self
             .active_downloads
             .lock()
-            .map_err(|_| AppError::Internal("блокировка очереди загрузок повреждена".into()))?
-            .insert(manifest_url.to_owned()))
+            .map_err(|_| AppError::Internal("блокировка очереди загрузок повреждена".into()))?;
+        if downloads.contains(manifest_url) {
+            return Ok(None);
+        }
+        let operation_sequence = self.next_operation_sequence()?;
+        downloads.insert(manifest_url.to_owned());
+        Ok(Some(operation_sequence))
     }
 
     pub fn release_download(&self, manifest_url: &str) {
@@ -385,6 +398,85 @@ impl AppState {
 
     pub fn node_client(&self) -> &NodeClient {
         &self.node_client
+    }
+
+    pub(crate) async fn lock_object_store(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.object_store.lock().await
+    }
+
+    pub(crate) fn register_package_refresh(
+        &self,
+        node_origin: &str,
+        package_id: &str,
+        operation_sequence: u64,
+    ) -> AppResult<bool> {
+        let mut operations = self
+            .package_operations
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка операций packages повреждена".into()))?;
+        let key = package_operation_key(node_origin, package_id);
+        if operations
+            .get(&key)
+            .is_some_and(|current| *current > operation_sequence)
+        {
+            return Ok(false);
+        }
+        operations.insert(key, operation_sequence);
+        Ok(true)
+    }
+
+    pub(crate) fn package_operation_is_current(
+        &self,
+        node_origin: &str,
+        package_id: &str,
+        operation_sequence: u64,
+    ) -> AppResult<bool> {
+        Ok(self
+            .package_operations
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка операций packages повреждена".into()))?
+            .get(&package_operation_key(node_origin, package_id))
+            .is_some_and(|current| *current == operation_sequence))
+    }
+
+    pub(crate) fn publish_package_if_current<T>(
+        &self,
+        node_origin: &str,
+        package_id: &str,
+        operation_sequence: u64,
+        publish: impl FnOnce() -> AppResult<T>,
+    ) -> AppResult<Option<T>> {
+        let operations = self
+            .package_operations
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка операций packages повреждена".into()))?;
+        if operations
+            .get(&package_operation_key(node_origin, package_id))
+            .is_none_or(|current| *current != operation_sequence)
+        {
+            return Ok(None);
+        }
+        publish().map(Some)
+    }
+
+    fn next_operation_sequence(&self) -> AppResult<u64> {
+        self.operation_sequence
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| AppError::Internal("package operation sequence exhausted".into()))
+    }
+
+    fn register_package_delete(&self, node_origin: &str, package_id: &str) -> AppResult<u64> {
+        let operation_sequence = self.next_operation_sequence()?;
+        self.package_operations
+            .lock()
+            .map_err(|_| AppError::Internal("блокировка операций packages повреждена".into()))?
+            .insert(
+                package_operation_key(node_origin, package_id),
+                operation_sequence,
+            );
+        Ok(operation_sequence)
     }
 
     pub async fn diagnose_node(
@@ -420,23 +512,13 @@ impl AppState {
         node_origin: String,
         package_id: String,
     ) -> AppResult<Vec<SavedModule>> {
-        if package_id.is_empty()
-            || matches!(package_id.as_str(), "." | "..")
-            || package_id.len() > 160
-            || !package_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-        {
-            return Err(AppError::InvalidPackage("invalid package_id".into()));
-        }
+        crate::downloads::validate_package_id(&package_id)?;
+        let node_origin = normalize_node_origin(&node_origin);
+        self.register_package_delete(&node_origin, &package_id)?;
+        let _object_store = self.lock_object_store().await;
         let orphaned_files = self.library.delete_package(&node_origin, &package_id)?;
-        let objects_dir = self.data_dir.join("objects");
-        for path in orphaned_files {
-            let path = PathBuf::from(path);
-            if path.starts_with(&objects_dir) {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-        }
+        crate::downloads::cleanup_path_strings(&self.library, &self.data_dir, &orphaned_files)
+            .await;
         let package_dir =
             crate::downloads::package_directory(&self.data_dir, &node_origin, &package_id);
         let _ = tokio::fs::remove_dir_all(package_dir).await;
@@ -553,11 +635,217 @@ impl AppState {
     }
 }
 
+fn normalize_node_origin(node_origin: &str) -> String {
+    node_origin.trim_end_matches('/').to_owned()
+}
+
+fn package_operation_key(node_origin: &str, package_id: &str) -> (String, String) {
+    (normalize_node_origin(node_origin), package_id.to_owned())
+}
+
 fn disconnected_state(node_url: Option<String>, message: Option<String>) -> ConnectionState {
     ConnectionState {
         status: ConnectionStatus::Disconnected,
         node_url,
         node_name: None,
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::library::PackageReplacement;
+
+    use super::AppState;
+
+    fn publish(state: &AppState, title: &str, root_url: &str) {
+        state
+            .library()
+            .replace_package(&PackageReplacement {
+                node_origin: "https://node.example",
+                module_id: "video",
+                module_title: "Video",
+                module_root_url: "/video",
+                package_id: "video_1",
+                package_title: title,
+                root_url,
+                saved_at: "1",
+                byte_size: 0,
+                resources: &[],
+            })
+            .unwrap();
+    }
+
+    fn publish_if_current(
+        state: &AppState,
+        operation_sequence: u64,
+        title: &str,
+        root_url: &str,
+    ) -> bool {
+        state
+            .publish_package_if_current(
+                "https://node.example",
+                "video_1",
+                operation_sequence,
+                || {
+                    publish(state, title, root_url);
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn coalesces_exact_duplicate_manifest_url() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path()).unwrap();
+
+        assert!(state.reserve_download("/manifest-a").unwrap().is_some());
+        assert!(state.reserve_download("/manifest-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_registered_refresh_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path()).unwrap();
+        let older = state.reserve_download("/manifest-a").unwrap().unwrap();
+        let newer = state.reserve_download("/manifest-b").unwrap().unwrap();
+        assert!(
+            state
+                .register_package_refresh("https://node.example/", "video_1", older)
+                .unwrap()
+        );
+        assert!(
+            state
+                .register_package_refresh("https://node.example", "video_1", newer)
+                .unwrap()
+        );
+
+        assert!(!publish_if_current(
+            &state,
+            older,
+            "Older manifest",
+            "/manifest-a"
+        ));
+        assert!(publish_if_current(
+            &state,
+            newer,
+            "Newer manifest",
+            "/manifest-b"
+        ));
+        assert_eq!(
+            state
+                .library()
+                .package_root_url("https://node.example", "video_1")
+                .unwrap(),
+            "/manifest-b"
+        );
+    }
+
+    #[test]
+    fn delete_after_refresh_prevents_resurrection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path()).unwrap();
+        publish(&state, "Existing", "/existing");
+        let older = state.reserve_download("/manifest-a").unwrap().unwrap();
+        assert!(
+            state
+                .register_package_refresh("https://node.example", "video_1", older)
+                .unwrap()
+        );
+
+        tauri::async_runtime::block_on(
+            state.delete_package("https://node.example/".into(), "video_1".into()),
+        )
+        .unwrap();
+
+        assert!(!publish_if_current(
+            &state,
+            older,
+            "Stale manifest",
+            "/stale"
+        ));
+        assert!(
+            state
+                .library()
+                .package_root_url("https://node.example", "video_1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn refresh_requested_after_delete_can_reinstall() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(directory.path()).unwrap();
+        publish(&state, "Existing", "/existing");
+        tauri::async_runtime::block_on(
+            state.delete_package("https://node.example".into(), "video_1".into()),
+        )
+        .unwrap();
+        let reinstall = state.reserve_download("/manifest-new").unwrap().unwrap();
+        assert!(
+            state
+                .register_package_refresh("https://node.example", "video_1", reinstall)
+                .unwrap()
+        );
+
+        assert!(publish_if_current(
+            &state,
+            reinstall,
+            "Reinstalled",
+            "/reinstalled"
+        ));
+        assert_eq!(
+            state
+                .library()
+                .package_root_url("https://node.example", "video_1")
+                .unwrap(),
+            "/reinstalled"
+        );
+    }
+
+    #[test]
+    fn serializes_same_package_updates_from_different_manifests() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new(directory.path()).unwrap());
+        assert!(state.reserve_download("/manifest-a").unwrap().is_some());
+        assert!(state.reserve_download("/manifest-b").unwrap().is_some());
+
+        tauri::async_runtime::block_on(async {
+            let first_update = state.lock_object_store().await;
+            let second_state = state.clone();
+            let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+            let (published_tx, mut published_rx) = tokio::sync::oneshot::channel();
+            let second_update = tauri::async_runtime::spawn(async move {
+                let _ = attempted_tx.send(());
+                let _object_store = second_state.lock_object_store().await;
+                publish(&second_state, "Second manifest", "/manifest-b");
+                let _ = published_tx.send(());
+            });
+            attempted_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                published_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            publish(&state, "First manifest", "/manifest-a");
+            drop(first_update);
+            published_rx.await.unwrap();
+            second_update.await.unwrap();
+        });
+
+        assert_eq!(
+            state
+                .library()
+                .package_root_url("https://node.example", "video_1")
+                .unwrap(),
+            "/manifest-b"
+        );
+        state.release_download("/manifest-a");
+        state.release_download("/manifest-b");
     }
 }

@@ -6,6 +6,28 @@ use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
 
+pub struct ResourceRecord {
+    pub resource_url: String,
+    pub resource_type: String,
+    pub local_path: String,
+    pub mime_type: Option<String>,
+    pub byte_size: u64,
+    pub sha256: String,
+}
+
+pub struct PackageReplacement<'a> {
+    pub node_origin: &'a str,
+    pub module_id: &'a str,
+    pub module_title: &'a str,
+    pub module_root_url: &'a str,
+    pub package_id: &'a str,
+    pub package_title: &'a str,
+    pub root_url: &'a str,
+    pub saved_at: &'a str,
+    pub byte_size: u64,
+    pub resources: &'a [ResourceRecord],
+}
+
 #[derive(Debug, Serialize)]
 pub struct SavedPackage {
     node_origin: String,
@@ -114,18 +136,17 @@ impl Library {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn begin_package(
-        &self,
-        node_origin: &str,
-        module_id: &str,
-        module_title: &str,
-        module_root_url: &str,
-        package_id: &str,
-        package_title: &str,
-        root_url: &str,
-        saved_at: &str,
-    ) -> AppResult<()> {
+    pub fn replace_package(&self, package: &PackageReplacement<'_>) -> AppResult<Vec<String>> {
+        let byte_size = i64::try_from(package.byte_size)
+            .map_err(|_| AppError::Storage("package exceeds SQLite integer size".into()))?;
+        let resource_sizes = package
+            .resources
+            .iter()
+            .map(|resource| {
+                i64::try_from(resource.byte_size)
+                    .map_err(|_| AppError::Storage("resource exceeds SQLite integer size".into()))
+            })
+            .collect::<AppResult<Vec<_>>>()?;
         let mut connection = self
             .connection
             .lock()
@@ -133,6 +154,21 @@ impl Library {
         let transaction = connection
             .transaction()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let previous_paths = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT local_path FROM resources
+                     WHERE node_origin = ?1 AND package_id = ?2",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            statement
+                .query_map(params![package.node_origin, package.package_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?
+        };
         transaction
             .execute(
                 "INSERT INTO modules (node_origin, module_id, module_title, module_root_url)
@@ -140,91 +176,155 @@ impl Library {
                  ON CONFLICT(node_origin, module_id) DO UPDATE SET
                    module_title = excluded.module_title,
                    module_root_url = excluded.module_root_url",
-                params![node_origin, module_id, module_title, module_root_url],
+                params![
+                    package.node_origin,
+                    package.module_id,
+                    package.module_title,
+                    package.module_root_url
+                ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         transaction
             .execute(
                 "INSERT INTO packages
                    (node_origin, package_id, module_id, package_title, root_url, status, byte_size, saved_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'downloading', 0, ?6)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7)
                  ON CONFLICT(node_origin, package_id) DO UPDATE SET
                    module_id = excluded.module_id,
                    package_title = excluded.package_title,
                    root_url = excluded.root_url,
-                   status = 'downloading',
-                   byte_size = 0,
+                   status = 'ready',
+                   byte_size = excluded.byte_size,
                    saved_at = excluded.saved_at",
-                params![node_origin, package_id, module_id, package_title, root_url, saved_at],
+                params![
+                    package.node_origin,
+                    package.package_id,
+                    package.module_id,
+                    package.package_title,
+                    package.root_url,
+                    byte_size,
+                    package.saved_at
+                ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         transaction
             .execute(
                 "DELETE FROM resources WHERE node_origin = ?1 AND package_id = ?2",
-                params![node_origin, package_id],
+                params![package.node_origin, package.package_id],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        for (resource, byte_size) in package.resources.iter().zip(resource_sizes) {
+            transaction
+                .execute(
+                    "INSERT INTO resources
+                       (node_origin, package_id, resource_url, resource_type, local_path, mime_type,
+                        byte_size, sha256)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        package.node_origin,
+                        package.package_id,
+                        resource.resource_url,
+                        resource.resource_type,
+                        resource.local_path,
+                        resource.mime_type,
+                        byte_size,
+                        resource.sha256
+                    ],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM modules
+                 WHERE node_origin = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM packages WHERE packages.node_origin = modules.node_origin
+                       AND packages.module_id = modules.module_id
+                   )",
+                params![package.node_origin],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut orphaned_paths = Vec::new();
+        for path in previous_paths {
+            let references: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM resources WHERE local_path = ?1",
+                    params![path],
+                    |row| row.get(0),
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            if references == 0 {
+                orphaned_paths.push(path);
+            }
+        }
         transaction
             .commit()
-            .map_err(|error| AppError::Storage(error.to_string()))
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(orphaned_paths)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn record_resource(
+    pub fn mime_type_for_resource(
         &self,
         node_origin: &str,
         package_id: &str,
         resource_url: &str,
         resource_type: &str,
-        local_path: &str,
-        mime_type: Option<&str>,
-        byte_size: u64,
         sha256: &str,
-    ) -> AppResult<()> {
+        byte_size: u64,
+    ) -> AppResult<Option<String>> {
         let byte_size = i64::try_from(byte_size)
             .map_err(|_| AppError::Storage("resource exceeds SQLite integer size".into()))?;
-        self.connection
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?
-            .execute(
-                "INSERT OR REPLACE INTO resources
-                   (node_origin, package_id, resource_url, resource_type, local_path, mime_type,
-                    byte_size, sha256)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    node_origin,
-                    package_id,
-                    resource_url,
-                    resource_type,
-                    local_path,
-                    mime_type,
-                    byte_size,
-                    sha256
-                ],
+            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT mime_type FROM resources
+                 WHERE sha256 = ?5 AND byte_size = ?6 AND mime_type IS NOT NULL
+                   AND node_origin = ?1 AND resource_url = ?3 AND resource_type = ?4
+                 ORDER BY
+                   CASE WHEN package_id = ?2 THEN 0 ELSE 1 END,
+                   package_id
+                 LIMIT 1",
             )
-            .map(|_| ())
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut rows = statement
+            .query(params![
+                node_origin,
+                package_id,
+                resource_url,
+                resource_type,
+                sha256,
+                byte_size
+            ])
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        rows.next()
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .map(|row| row.get(0))
+            .transpose()
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
-    pub fn finish_package(
-        &self,
-        node_origin: &str,
-        package_id: &str,
-        status: &str,
-        byte_size: u64,
-    ) -> AppResult<()> {
-        let byte_size = i64::try_from(byte_size)
-            .map_err(|_| AppError::Storage("package exceeds SQLite integer size".into()))?;
-        self.connection
+    pub fn unreferenced_paths(&self, paths: &[String]) -> AppResult<Vec<String>> {
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?
-            .execute(
-                "UPDATE packages SET status = ?3, byte_size = ?4
-                 WHERE node_origin = ?1 AND package_id = ?2",
-                params![node_origin, package_id, status, byte_size],
-            )
-            .map(|_| ())
-            .map_err(|error| AppError::Storage(error.to_string()))
+            .map_err(|_| AppError::Internal("блокировка каталога повреждена".into()))?;
+        let mut statement = connection
+            .prepare("SELECT EXISTS(SELECT 1 FROM resources WHERE local_path = ?1)")
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut unreferenced = Vec::new();
+        for path in paths {
+            let referenced: bool = statement
+                .query_row(params![path], |row| row.get(0))
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            if !referenced {
+                unreferenced.push(path.clone());
+            }
+        }
+        Ok(unreferenced)
     }
 
     pub fn delete_package(&self, node_origin: &str, package_id: &str) -> AppResult<Vec<String>> {
@@ -500,7 +600,7 @@ fn migrate(connection: &Connection) -> AppResult<()> {
                  ) STRICT;
                  CREATE INDEX IF NOT EXISTS packages_module_idx
                    ON packages(node_origin, module_id, saved_at DESC);
-                 CREATE TABLE IF NOT EXISTS resources (
+                  CREATE TABLE IF NOT EXISTS resources (
                    node_origin TEXT NOT NULL,
                    package_id TEXT NOT NULL,
                    resource_url TEXT NOT NULL,
@@ -511,21 +611,61 @@ fn migrate(connection: &Connection) -> AppResult<()> {
                    sha256 TEXT NOT NULL,
                    PRIMARY KEY (node_origin, package_id, resource_url),
                    FOREIGN KEY (node_origin, package_id) REFERENCES packages(node_origin, package_id)
-                     ON DELETE CASCADE
-                  ) STRICT;
-                 PRAGMA user_version = 1;
-                 COMMIT;",
+                      ON DELETE CASCADE
+                   ) STRICT;
+                  CREATE INDEX IF NOT EXISTS resources_local_path_idx ON resources(local_path);
+                  CREATE INDEX IF NOT EXISTS resources_sha256_idx ON resources(sha256);
+                  PRAGMA user_version = 1;
+                  COMMIT;",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
     }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS resources_local_path_idx ON resources(local_path);
+             CREATE INDEX IF NOT EXISTS resources_sha256_idx ON resources(sha256);",
+        )
+        .map_err(|error| AppError::Storage(error.to_string()))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
-    use super::{Library, migrate};
+    use super::{Library, PackageReplacement, ResourceRecord, migrate};
+
+    fn resource(url: &str, path: &str, sha256: &str) -> ResourceRecord {
+        ResourceRecord {
+            resource_url: url.into(),
+            resource_type: "binary".into(),
+            local_path: path.into(),
+            mime_type: Some("video/mp4".into()),
+            byte_size: 42,
+            sha256: sha256.into(),
+        }
+    }
+
+    fn publish(
+        library: &Library,
+        package_id: &str,
+        package_title: &str,
+        root_url: &str,
+        resources: &[ResourceRecord],
+    ) -> crate::error::AppResult<Vec<String>> {
+        library.replace_package(&PackageReplacement {
+            node_origin: "https://node.example",
+            module_id: "video",
+            module_title: "Video",
+            module_root_url: "/video",
+            package_id,
+            package_title,
+            root_url,
+            saved_at: "1",
+            byte_size: resources.iter().map(|resource| resource.byte_size).sum(),
+            resources,
+        })
+    }
 
     #[test]
     fn creates_versioned_schema() {
@@ -540,20 +680,28 @@ mod tests {
     #[test]
     fn recovers_interrupted_downloads_on_open() {
         let directory = tempfile::tempdir().unwrap();
-        let library = Library::open(directory.path()).unwrap();
-        library
-            .begin_package(
-                "https://node.example",
-                "video",
-                "Video",
-                "/video",
-                "video_1",
-                "Example",
-                "/video?package_id=video_1",
-                "1",
+        let connection = Connection::open(directory.path().join("library.sqlite3")).unwrap();
+        migrate(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO modules VALUES (?1, ?2, ?3, ?4)",
+                params!["https://node.example", "video", "Video", "/video"],
             )
             .unwrap();
-        drop(library);
+        connection
+            .execute(
+                "INSERT INTO packages VALUES (?1, ?2, ?3, ?4, ?5, 'downloading', 0, ?6)",
+                params![
+                    "https://node.example",
+                    "video_1",
+                    "video",
+                    "Example",
+                    "/video?package_id=video_1",
+                    "1"
+                ],
+            )
+            .unwrap();
+        drop(connection);
 
         let library = Library::open(directory.path()).unwrap();
         let modules = library.modules().unwrap();
@@ -564,18 +712,7 @@ mod tests {
     fn deletes_package_and_empty_module() {
         let directory = tempfile::tempdir().unwrap();
         let library = Library::open(directory.path()).unwrap();
-        library
-            .begin_package(
-                "https://node.example",
-                "video",
-                "Video",
-                "/video",
-                "video_1",
-                "Example",
-                "/video?package_id=video_1",
-                "1",
-            )
-            .unwrap();
+        publish(&library, "video_1", "Example", "/video", &[]).unwrap();
 
         let orphaned = library
             .delete_package("https://node.example", "video_1")
@@ -589,21 +726,14 @@ mod tests {
     fn returns_module_identity_for_ready_package() {
         let directory = tempfile::tempdir().unwrap();
         let library = Library::open(directory.path()).unwrap();
-        library
-            .begin_package(
-                "https://node.example",
-                "video",
-                "Video",
-                "/video",
-                "video_1",
-                "Example",
-                "/video?package_id=video_1",
-                "1",
-            )
-            .unwrap();
-        library
-            .finish_package("https://node.example", "video_1", "ready", 42)
-            .unwrap();
+        publish(
+            &library,
+            "video_1",
+            "Example",
+            "/video?package_id=video_1",
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             library
@@ -621,6 +751,159 @@ mod tests {
                 .module_identity("https://node.example", "video")
                 .unwrap(),
             ("Video".into(), "/video".into())
+        );
+    }
+
+    #[test]
+    fn atomically_replaces_resources_and_reports_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let old = resource("/old", "/objects/old", "old");
+        publish(&library, "video_1", "Old", "/old-root", &[old]).unwrap();
+
+        let new = resource("/new", "/objects/new", "new");
+        let orphaned = publish(&library, "video_1", "New", "/new-root", &[new]).unwrap();
+
+        assert_eq!(orphaned, vec!["/objects/old"]);
+        assert!(
+            library
+                .resource("https://node.example", "video_1", "/old")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            library
+                .resource("https://node.example", "video_1", "/new")
+                .unwrap()
+                .unwrap()
+                .local_path,
+            "/objects/new"
+        );
+        let modules = library.modules().unwrap();
+        assert_eq!(modules[0].packages[0].package_title, "New");
+        assert_eq!(modules[0].packages[0].root_url, "/new-root");
+        assert_eq!(modules[0].packages[0].status, "ready");
+    }
+
+    #[test]
+    fn failed_replacement_preserves_ready_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let old = resource("/old", "/objects/old", "old");
+        publish(&library, "video_1", "Old", "/old-root", &[old]).unwrap();
+        let invalid = [
+            resource("/duplicate", "/objects/new-a", "new-a"),
+            resource("/duplicate", "/objects/new-b", "new-b"),
+        ];
+
+        assert!(publish(&library, "video_1", "New", "/new-root", &invalid).is_err());
+
+        let modules = library.modules().unwrap();
+        assert_eq!(modules[0].packages[0].package_title, "Old");
+        assert_eq!(modules[0].packages[0].root_url, "/old-root");
+        assert_eq!(modules[0].packages[0].status, "ready");
+        assert_eq!(
+            library
+                .resource("https://node.example", "video_1", "/old")
+                .unwrap()
+                .unwrap()
+                .local_path,
+            "/objects/old"
+        );
+    }
+
+    #[test]
+    fn shared_object_is_not_orphaned() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        publish(
+            &library,
+            "video_1",
+            "One",
+            "/one",
+            &[resource("/one", "/objects/shared", "shared")],
+        )
+        .unwrap();
+        publish(
+            &library,
+            "video_2",
+            "Two",
+            "/two",
+            &[resource("/two", "/objects/shared", "shared")],
+        )
+        .unwrap();
+
+        let orphaned = publish(
+            &library,
+            "video_1",
+            "One updated",
+            "/one",
+            &[resource("/new", "/objects/new", "new")],
+        )
+        .unwrap();
+
+        assert!(orphaned.is_empty());
+        assert_eq!(
+            library
+                .resource("https://node.example", "video_2", "/two")
+                .unwrap()
+                .unwrap()
+                .local_path,
+            "/objects/shared"
+        );
+    }
+
+    #[test]
+    fn deterministically_prefers_matching_resource_mime_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path()).unwrap();
+        let mut fallback = resource("/target", "/objects/shared", "shared");
+        fallback.mime_type = Some("video/fallback".into());
+        publish(&library, "a_fallback", "Fallback", "/fallback", &[fallback]).unwrap();
+        let mut exact = resource("/target", "/objects/shared", "shared");
+        exact.mime_type = Some("video/exact".into());
+        publish(&library, "z_exact", "Exact", "/target", &[exact]).unwrap();
+
+        assert_eq!(
+            library
+                .mime_type_for_resource(
+                    "https://node.example",
+                    "z_exact",
+                    "/target",
+                    "binary",
+                    "shared",
+                    42,
+                )
+                .unwrap()
+                .as_deref(),
+            Some("video/exact")
+        );
+        assert_eq!(
+            library
+                .mime_type_for_resource(
+                    "https://node.example",
+                    "new_package",
+                    "/target",
+                    "binary",
+                    "shared",
+                    42,
+                )
+                .unwrap()
+                .as_deref(),
+            Some("video/fallback")
+        );
+        assert!(
+            library
+                .mime_type_for_resource(
+                    "https://node.example",
+                    "new_package",
+                    "/target",
+                    "css",
+                    "shared",
+                    42,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 }
