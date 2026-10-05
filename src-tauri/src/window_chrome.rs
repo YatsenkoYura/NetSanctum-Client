@@ -62,6 +62,7 @@ pub fn show_content(app: &AppHandle, view: ActiveView) -> AppResult<()> {
 }
 
 pub fn show_home(app: &AppHandle) {
+    lock_sealed_best_effort(app);
     for label in ["node", "offline"] {
         if let Some(webview) = app.get_webview(label) {
             let _ = webview.hide();
@@ -96,6 +97,9 @@ pub fn handle_chrome_action(app: &AppHandle, action: &str) {
     };
     match action {
         "home" => show_home(app),
+        // show_home hides the content views and locks the sealed keys as a
+        // side effect — exactly what the offline viewer's LOCK button wants.
+        "lock-sealed" => show_home(app),
         "back" => navigate_back(app),
         "minimize" => {
             let _ = window.minimize();
@@ -118,6 +122,7 @@ pub fn handle_chrome_action(app: &AppHandle, action: &str) {
 }
 
 pub fn hide_or_close(app: &AppHandle) {
+    lock_sealed_best_effort(app);
     let Some(window) = app.get_window("main") else {
         return;
     };
@@ -126,6 +131,20 @@ pub fn hide_or_close(app: &AppHandle) {
     } else {
         let _ = window.close();
     }
+}
+
+/// Forget the gateway's sealed keys without touching anything else. Fired
+/// whenever the content views hide, so a sealed package left open does not
+/// stay unlocked behind a hidden window — the idle timeout remains as the
+/// backstop. Best-effort by design: locking is idempotent, and a missed lock
+/// only shortens nothing (the timeout still applies).
+fn lock_sealed_best_effort(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Ok(gateway) = app.state::<AppState>().offline_gateway().await {
+            gateway.lock_sealed().await;
+        }
+    });
 }
 
 pub fn install_tray(app: &App) -> tauri::Result<()> {

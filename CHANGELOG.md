@@ -4,6 +4,20 @@ All notable changes will be documented here. The project follows Semantic Versio
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-05
+
+### Added
+
+- Sealed offline packages (transfer v1): Vault collections download as
+  ciphertext and open offline with decrypt-on-serve — the items snapshot as
+  `no-store` JSON, media as a tag-verified chunk stream with real 206 Range
+  support. Package keys unwrap from the manifest `sealing` descriptor with the
+  collection passphrase and live only in the gateway session.
+- Sealed idle lock: unwrapped package keys drop after 15 minutes without
+  sealed requests, hiding the views or pressing LOCK in the offline viewer
+  locks immediately, and locked sealed URLs answer 403 — never a ciphertext
+  fallback. Sealed packages stay unavailable on Android (fail-closed).
+
 ## [2.0.6] - 2026-09-19
 
 ### Fixed

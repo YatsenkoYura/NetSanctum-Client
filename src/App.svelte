@@ -18,6 +18,10 @@
     openNodeModule,
     openOffline,
     openOfflineModule,
+    openOfflineModuleSealed,
+    openOfflineSealed,
+    packageNeedsPassphrase,
+    sealedPackagesInModule,
     resetConnection,
     showHome,
     shortcutOnlineAvailable,
@@ -259,7 +263,21 @@
   async function showOfflineModule(nodeOrigin: string, moduleId: string) {
     error = "";
     try {
-      await openOfflineModule(nodeOrigin, moduleId);
+      const sealed = await sealedPackagesInModule(nodeOrigin, moduleId);
+      if (sealed.length === 0) {
+        await openOfflineModule(nodeOrigin, moduleId);
+        return;
+      }
+      // Known residual: the phrases cross JS memory via prompt(). The
+      // backend holds them only to unwrap the package DEKs into the gateway
+      // session; a native OS password prompt is the follow-up.
+      const phrases = [];
+      for (const packageId of sealed) {
+        const passphrase = prompt(`Парольная фраза sealed-пакета «${packageId}»`);
+        if (passphrase === null) return;
+        phrases.push({ packageId, passphrase });
+      }
+      await openOfflineModuleSealed(nodeOrigin, moduleId, phrases);
     } catch (cause) {
       error = describeError(cause);
     }
@@ -399,7 +417,15 @@
     shortcutBusy = true;
     shortcutError = "";
     try {
-      await openOffline(nodeOrigin, packageId);
+      if (await packageNeedsPassphrase(nodeOrigin, packageId)) {
+        // Same residual as module open: prompt() keeps the phrase in JS
+        // memory; native OS prompt is the follow-up.
+        const passphrase = prompt(`Парольная фраза sealed-пакета «${packageId}»`);
+        if (passphrase === null) return;
+        await openOfflineSealed(nodeOrigin, packageId, passphrase);
+      } else {
+        await openOffline(nodeOrigin, packageId);
+      }
       closeShortcut();
     } catch (cause) {
       shortcutError = describeError(cause);

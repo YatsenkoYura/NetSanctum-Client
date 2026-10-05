@@ -26,6 +26,8 @@ struct PackageManifest {
     module: ModuleManifest,
     root_url: String,
     resources: Vec<ResourceManifest>,
+    #[serde(default)]
+    sealing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +44,8 @@ struct ResourceManifest {
     resource_type: String,
     size: Option<u64>,
     sha256: Option<String>,
+    #[serde(default)]
+    mime: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -465,11 +469,16 @@ async fn download_resource(
         )));
     }
     let expected_size = resource.size.or(response.content_length());
-    let mime_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // Sealed endpoints answer `application/octet-stream` for everything, so a
+    // sealed resource carries its serving mime in the manifest instead. Plain
+    // resources keep trusting the response header, as before.
+    let mime_type = resource.mime.clone().or_else(|| {
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    });
     tokio::fs::create_dir_all(download_directory)
         .await
         .map_err(|error| storage_error("create download directory", download_directory, error))?;
@@ -766,9 +775,52 @@ fn validate_manifest(manifest: &PackageManifest) -> AppResult<()> {
         "text",
     ];
     let mut urls = HashSet::new();
+    let sealed = manifest.sealing.is_some();
+    if sealed {
+        // A sealed manifest carries ciphertext only: every resource is an
+        // opaque sealed envelope, and the `sealing` object holds the wrapped
+        // package key. Forged KDF costs are rejected here — before anything
+        // is derived — by validating the descriptor without a passphrase.
+        crate::sealed::parse_sealing(
+            manifest
+                .sealing
+                .as_ref()
+                .expect("sealed manifest has sealing"),
+        )?;
+        if manifest.module.id != "vault" {
+            return Err(AppError::InvalidPackage("unknown sealed module".into()));
+        }
+    }
     for resource in &manifest.resources {
         validate_relative_url(&resource.url)?;
-        if !allowed_types.contains(&resource.resource_type.as_str()) {
+        if resource.resource_type == "sealed" {
+            if !sealed {
+                return Err(AppError::InvalidPackage(
+                    "sealed resource without a sealed manifest".into(),
+                ));
+            }
+            // Ciphertext has no size or hash here: fresh nonces per generation
+            // make sealed bytes dynamic, so they are re-downloaded on every
+            // refresh and verified by AEAD tags at open time, not by manifest.
+            if resource.size.is_some() || resource.sha256.is_some() {
+                return Err(AppError::InvalidPackage(
+                    "sealed resource must not carry size or hash".into(),
+                ));
+            }
+            let mime = resource.mime.as_deref().unwrap_or_default();
+            if mime.is_empty()
+                || mime.len() > 256
+                || !mime.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(AppError::InvalidPackage(
+                    "invalid sealed resource mime".into(),
+                ));
+            }
+        } else if sealed {
+            return Err(AppError::InvalidPackage(
+                "sealed manifest must only list sealed resources".into(),
+            ));
+        } else if !allowed_types.contains(&resource.resource_type.as_str()) {
             return Err(AppError::InvalidPackage(format!(
                 "unsupported resource type: {}",
                 resource.resource_type
@@ -838,6 +890,40 @@ pub(crate) fn package_directory(data_dir: &Path, node_origin: &str, package_id: 
         .join(digest_hex(package_id))
 }
 
+/// The stored manifest of a downloaded package, as JSON. The gateway reads it
+/// to find the `sealing` descriptor of sealed packages; nothing here is
+/// trusted for sizes or hashes of sealed bytes (those verify by AEAD tag).
+pub(crate) async fn read_package_manifest(
+    data_dir: &Path,
+    node_origin: &str,
+    package_id: &str,
+) -> AppResult<serde_json::Value> {
+    let path = package_directory(data_dir, node_origin, package_id).join("manifest.json");
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| storage_error("read stored manifest", &path, error))?;
+    if bytes.len() > MAX_MANIFEST_BYTES as usize {
+        return Err(AppError::InvalidPackage(
+            "stored manifest is too large".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::InvalidPackage(format!("stored manifest is invalid: {error}")))
+}
+
+/// True when the stored manifest carries a `sealing` descriptor: the package
+/// opens only with its passphrase, never as plain bytes.
+pub(crate) async fn package_is_sealed(
+    data_dir: &Path,
+    node_origin: &str,
+    package_id: &str,
+) -> AppResult<bool> {
+    Ok(read_package_manifest(data_dir, node_origin, package_id)
+        .await?
+        .get("sealing")
+        .is_some())
+}
+
 async fn read_limited(response: reqwest::Response, limit: u64) -> AppResult<Vec<u8>> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
@@ -867,8 +953,9 @@ fn emit(app: &AppHandle, event: DownloadEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackageManifest, ResourceManifest, gc_unreferenced_objects, is_object_path, object_path,
-        reusable_object, validate_manifest, validate_package_id, validate_resource_status,
+        ModuleManifest, PackageManifest, ResourceManifest, gc_unreferenced_objects, is_object_path,
+        object_path, reusable_object, validate_manifest, validate_package_id,
+        validate_resource_status,
     };
     use crate::error::AppError;
     use crate::library::{Library, PackageReplacement, ResourceRecord};
@@ -879,6 +966,38 @@ mod tests {
             resource_type: "binary".into(),
             size,
             sha256: sha256.map(str::to_owned),
+            mime: None,
+        }
+    }
+
+    fn sealed_resource(url: &str) -> ResourceManifest {
+        ResourceManifest {
+            url: url.into(),
+            resource_type: "sealed".into(),
+            size: None,
+            sha256: None,
+            mime: Some("application/octet-stream".into()),
+        }
+    }
+
+    fn sealed_manifest(resources: Vec<ResourceManifest>) -> PackageManifest {
+        PackageManifest {
+            schema_version: 1,
+            package_id: "vault_sealed_7".into(),
+            package_title: "Vault (sealed)".into(),
+            module: ModuleManifest {
+                id: "vault".into(),
+                title: "Vault".into(),
+                root_url: "/api/vault/sealed/7/items?package_id=vault_sealed_7".into(),
+            },
+            root_url: "/api/vault/sealed/7/items?package_id=vault_sealed_7".into(),
+            resources,
+            sealing: Some(serde_json::json!({
+                "version": 1,
+                "kdf": {"algorithm": "argon2id", "m_cost": 65536, "t_cost": 3, "parallelism": 1},
+                "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+                "wrapped_dek": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            })),
         }
     }
 
@@ -934,6 +1053,35 @@ mod tests {
             assert!(validate_package_id(invalid).is_err(), "accepted {invalid}");
         }
         assert!(validate_package_id(&format!("a{}", "b".repeat(128))).is_err());
+    }
+
+    #[test]
+    fn accepts_sealed_manifest_and_rejects_mixed_or_forged() {
+        let manifest = sealed_manifest(vec![
+            sealed_resource("/api/vault/sealed/7/items?package_id=vault_sealed_7"),
+            sealed_resource("/api/vault/sealed/media/42?package_id=vault_sealed_7"),
+        ]);
+        validate_manifest(&manifest).unwrap();
+
+        // A sealed resource without the `sealing` descriptor is refused.
+        let mut plain = sealed_manifest(vec![sealed_resource("/sealed")]);
+        plain.sealing = None;
+        assert!(validate_manifest(&plain).is_err());
+
+        // Plain resources may not ride along in a sealed manifest.
+        let mut mixed = sealed_manifest(vec![sealed_resource("/sealed"), resource(None, None)]);
+        mixed.resources[1].url = "/plain".into();
+        assert!(validate_manifest(&mixed).is_err());
+
+        // Sealed resources carry neither size nor hash.
+        let mut sized = sealed_manifest(vec![sealed_resource("/sealed")]);
+        sized.resources[0].size = Some(10);
+        assert!(validate_manifest(&sized).is_err());
+
+        // Forged KDF costs are rejected at download, without a passphrase.
+        let mut evil = sealed_manifest(vec![sealed_resource("/sealed")]);
+        evil.sealing.as_mut().unwrap()["kdf"]["m_cost"] = serde_json::Value::from(1024 * 1024);
+        assert!(validate_manifest(&evil).is_err());
     }
 
     #[test]

@@ -27,6 +27,29 @@ The master token is stored in an application-owned, cross-platform encrypted env
 
 No encryption key or password is persisted, so the user unlocks the vault once after each process start. This intentionally avoids platform keyring dependencies and fake machine-ID encryption.
 
+## Sealed offline packages
+
+Sealed packages (`type: sealed` resources plus a manifest `sealing` descriptor)
+download and rest as ciphertext. The Rust core (`src-tauri/src/sealed/`)
+mirrors the node's transfer v1 byte-for-byte: Argon2id KEK with NFC
+passphrase spelling, wrapped package DEK, HKDF-SHA256 per-resource keys,
+whole small envelopes for the items snapshot, chunked envelopes with per-chunk
+AEAD for media. The loopback gateway decrypts per request under the session's
+unwrapped package key — full snapshot as `no-store` JSON, media as a
+tag-verified chunk stream with real 206 Range support — and never writes
+plaintext back to disk (covered by the disk-canary test). Unwrapped package
+keys live only in the gateway session: a 15-minute sealed-idle timeout drops
+them, leaving the viewer hides them (`show_home`, tray-hide, and the offline
+viewer's LOCK button all lock), and after a lock sealed URLs answer 403 —
+never a ciphertext fallback.
+
+Known residual, stated openly: the sealed passphrase currently travels from
+the WebView to the backend via `prompt()` + a Tauri command, so the phrase
+crosses JS memory — the one exception to "secrets never enter JavaScript"
+above. Ciphertext-at-rest and decrypt-on-serve hold regardless. The follow-up
+is a native OS password prompt; until it lands, the backend wraps the phrase
+in `Zeroizing` at the gateway boundary and never persists, logs, or caches it.
+
 ## Authentication
 
 The current NetSanctum compatibility path posts the master token to `POST /auth/ui/login`, captures the resulting HttpOnly-style temporary session identifier inside Rust, and verifies it through `GET /auth/me`. The cookie is not installed into the local shell or exposed to JavaScript. The Rust gateway will attach it to upstream requests.

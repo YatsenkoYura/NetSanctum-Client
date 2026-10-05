@@ -29,6 +29,8 @@ pub enum AppError {
     SessionMissing,
     #[error("Некорректный offline package: {0}")]
     InvalidPackage(String),
+    #[error("Неверная парольная фраза sealed-пакета или пакет повреждён.")]
+    SealedUnlock,
     #[error("Не удалось скачать offline package: {0}")]
     Download(String),
     #[error("Offline package operation was superseded by a newer request")]

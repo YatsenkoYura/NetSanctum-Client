@@ -143,6 +143,46 @@ export function openOffline(nodeOrigin: string, packageId: string): Promise<void
   return invoke("open_offline", { nodeOrigin, packageId });
 }
 
+export function packageNeedsPassphrase(nodeOrigin: string, packageId: string): Promise<boolean> {
+  return invoke("package_needs_passphrase", { nodeOrigin, packageId });
+}
+
+export interface SealedPhrase {
+  packageId: string;
+  passphrase: string;
+}
+
+// Residual, stated at the call sites too: the passphrase crosses JS memory
+// on its way to the backend. Ciphertext-at-rest and decrypt-on-serve hold
+// regardless; a native OS password prompt is the follow-up that takes the
+// WebView out of the phrase's path.
+export function openOfflineSealed(
+  nodeOrigin: string,
+  packageId: string,
+  passphrase: string,
+): Promise<void> {
+  return invoke("open_offline_sealed", { nodeOrigin, packageId, passphrase });
+}
+
+export function sealedPackagesInModule(
+  nodeOrigin: string,
+  moduleId: string,
+): Promise<string[]> {
+  return invoke("sealed_packages_in_module", { nodeOrigin, moduleId });
+}
+
+export function openOfflineModuleSealed(
+  nodeOrigin: string,
+  moduleId: string,
+  phrases: SealedPhrase[],
+): Promise<void> {
+  return invoke("open_offline_module_sealed", { nodeOrigin, moduleId, phrases });
+}
+
+export function lockOfflineSealed(): Promise<void> {
+  return invoke("lock_offline_sealed");
+}
+
 export function openOfflineModule(nodeOrigin: string, moduleId: string): Promise<void> {
   return invoke("open_offline_module", { nodeOrigin, moduleId });
 }

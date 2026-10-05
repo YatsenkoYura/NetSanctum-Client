@@ -15,6 +15,7 @@ mod nsp;
 mod offline_gateway;
 #[cfg(not(mobile))]
 mod offline_view;
+mod sealed;
 mod state;
 #[cfg(not(mobile))]
 mod window_chrome;
@@ -23,6 +24,20 @@ use state::{AppState, BootstrapState, ConnectRequest, ConnectionState};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::error::AppResult;
+
+#[derive(serde::Deserialize)]
+struct SealedPhrase {
+    package_id: String,
+    passphrase: String,
+}
+
+/// Forget the gateway's sealed keys. Plain offline packages keep working;
+/// sealed URLs answer 403 until their passphrases unwrap them again.
+#[tauri::command]
+async fn lock_offline_sealed(state: State<'_, AppState>) -> AppResult<()> {
+    state.offline_gateway().await?.lock_sealed().await;
+    Ok(())
+}
 
 #[tauri::command]
 async fn bootstrap(app: AppHandle, state: State<'_, AppState>) -> AppResult<BootstrapState> {
@@ -62,6 +77,89 @@ async fn shortcut_online_available(
 #[tauri::command]
 fn download_package(app: AppHandle, manifest_url: String) -> AppResult<bool> {
     downloads::enqueue(&app, manifest_url)
+}
+
+#[tauri::command]
+async fn package_needs_passphrase(
+    state: State<'_, AppState>,
+    node_origin: String,
+    package_id: String,
+) -> AppResult<bool> {
+    downloads::package_is_sealed(state.data_dir(), &node_origin, &package_id).await
+}
+
+#[tauri::command]
+async fn sealed_packages_in_module(
+    state: State<'_, AppState>,
+    node_origin: String,
+    module_id: String,
+) -> AppResult<Vec<String>> {
+    let (_, package_ids) = state
+        .library()
+        .module_offline_info(&node_origin, &module_id)?;
+    let mut sealed = Vec::new();
+    for package_id in package_ids {
+        if downloads::package_is_sealed(state.data_dir(), &node_origin, &package_id).await? {
+            sealed.push(package_id);
+        }
+    }
+    Ok(sealed)
+}
+
+/// Passphrase residual, stated openly: this command receives the sealed
+/// package's passphrase from the WebView, so the phrase crosses JS memory on
+/// its way here. The ciphertext on disk and the gateway's decrypt-on-serve
+/// hold regardless — but the snowden bar ("no plaintext outside RAM, and the
+/// phrase never in the renderer") needs a native OS password prompt instead
+/// of the web form. That prompt is the known follow-up; this command is the
+/// working path until it lands. The phrase is wrapped in `Zeroizing` at the
+/// gateway boundary and never persisted, logged, or cached.
+#[tauri::command]
+async fn open_offline_sealed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    node_origin: String,
+    package_id: String,
+    passphrase: String,
+) -> AppResult<()> {
+    #[cfg(not(mobile))]
+    {
+        return offline_view::open_sealed(&app, &state, node_origin, package_id, passphrase).await;
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (app, state, node_origin, package_id, passphrase);
+        Err(crate::error::AppError::Internal(
+            "Sealed packages are not supported on this platform yet.".into(),
+        ))
+    }
+}
+
+#[tauri::command]
+async fn open_offline_module_sealed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    node_origin: String,
+    module_id: String,
+    phrases: Vec<SealedPhrase>,
+) -> AppResult<()> {
+    #[cfg(not(mobile))]
+    {
+        // Same residual as `open_offline_sealed`: phrases cross the WebView.
+        let pairs = phrases
+            .into_iter()
+            .map(|phrase| (phrase.package_id, phrase.passphrase))
+            .collect::<Vec<_>>();
+        return offline_view::open_module_sealed(&app, &state, node_origin, module_id, &pairs)
+            .await;
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (app, state, node_origin, module_id, phrases);
+        Err(crate::error::AppError::Internal(
+            "Sealed packages are not supported on this platform yet.".into(),
+        ))
+    }
 }
 
 #[tauri::command]
@@ -244,6 +342,11 @@ async fn open_offline(
     }
     #[cfg(target_os = "android")]
     {
+        if downloads::package_is_sealed(state.data_dir(), &node_origin, &package_id).await? {
+            return Err(crate::error::AppError::Internal(
+                "Sealed packages are not supported on this platform yet.".into(),
+            ));
+        }
         let (root_url, module_id, module_title, module_path) = state
             .library()
             .package_module_info(&node_origin, &package_id)?;
@@ -288,6 +391,13 @@ async fn open_offline_module(
         let (root_url, package_ids) = state
             .library()
             .module_offline_info(&node_origin, &module_id)?;
+        for package_id in &package_ids {
+            if downloads::package_is_sealed(state.data_dir(), &node_origin, package_id).await? {
+                return Err(crate::error::AppError::Internal(
+                    "Sealed packages are not supported on this platform yet.".into(),
+                ));
+            }
+        }
         let (module_title, module_path) =
             state.library().module_identity(&node_origin, &module_id)?;
         let access = state
@@ -450,12 +560,17 @@ pub fn run() {
             delete_package,
             open_offline,
             open_offline_module,
+            package_needs_passphrase,
+            sealed_packages_in_module,
+            open_offline_sealed,
+            open_offline_module_sealed,
+            lock_offline_sealed,
             is_mobile,
             create_module_shortcut,
             take_mobile_shortcut,
             show_home,
             navigate_back,
-            hide_to_tray
+            hide_to_tray,
         ])
         .run(tauri::generate_context!())
         .expect("Netsanctum Client runtime failed");

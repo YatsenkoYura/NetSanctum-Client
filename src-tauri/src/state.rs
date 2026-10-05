@@ -396,6 +396,10 @@ impl AppState {
         &self.library
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub fn node_client(&self) -> &NodeClient {
         &self.node_client
     }
@@ -527,7 +531,9 @@ impl AppState {
 
     pub async fn offline_gateway(&self) -> AppResult<&crate::offline_gateway::OfflineGateway> {
         self.offline_gateway
-            .get_or_try_init(|| crate::offline_gateway::OfflineGateway::start(self.library.clone()))
+            .get_or_try_init(|| {
+                crate::offline_gateway::OfflineGateway::start(self.library.clone(), &self.data_dir)
+            })
             .await
     }
 

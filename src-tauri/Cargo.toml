@@ -1,6 +1,6 @@
 [package]
 name = "netsanctum-desktop"
-version = "2.0.7"
+version = "2.1.0"
 description = "Secure offline client companion for NetSanctum"
 authors = ["NetSanctum contributors"]
 edition = "2024"
@@ -27,6 +27,7 @@ chacha20poly1305 = "0.10.1"
 cookie = "0.18.2"
 futures-util = "0.3.34"
 getrandom = "0.3.4"
+hkdf = "0.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -37,6 +38,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "sync", "time"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
+unicode-normalization = "0.1.24"
 url = { version = "2.5.8", features = ["serde"] }
 zeroize = "1.9.0"
 

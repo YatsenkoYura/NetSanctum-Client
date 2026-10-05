@@ -45,6 +45,50 @@ pub async fn open_module(
     open_access(app, root_url, access).await
 }
 
+/// Open one sealed package: the passphrase unwraps the package DEK into the
+/// gateway session, and every byte the viewer loads is decrypted per request.
+/// The passphrase itself travels from the UI to this command — see the
+/// residual note on `open_offline_sealed` in `lib.rs`: a native OS prompt is
+/// the follow-up that removes the WebView from the phrase's path.
+pub async fn open_sealed(
+    app: &AppHandle,
+    state: &AppState,
+    node_origin: String,
+    package_id: String,
+    passphrase: String,
+) -> AppResult<()> {
+    let root_url = state
+        .library()
+        .package_root_url(&node_origin, &package_id)?;
+    if !root_url.starts_with('/') || root_url.starts_with("//") || root_url.contains('#') {
+        return Err(AppError::InvalidPackage("invalid offline root URL".into()));
+    }
+    let access = state
+        .offline_gateway()
+        .await?
+        .activate_sealed(node_origin, package_id, passphrase)
+        .await?;
+    open_access(app, root_url, access).await
+}
+
+pub async fn open_module_sealed(
+    app: &AppHandle,
+    state: &AppState,
+    node_origin: String,
+    module_id: String,
+    phrases: &[(String, String)],
+) -> AppResult<()> {
+    let (root_url, package_ids) = state
+        .library()
+        .module_offline_info(&node_origin, &module_id)?;
+    let access = state
+        .offline_gateway()
+        .await?
+        .activate_module_sealed(node_origin, package_ids, phrases)
+        .await?;
+    open_access(app, root_url, access).await
+}
+
 async fn open_access(app: &AppHandle, root_url: String, access: OfflineAccess) -> AppResult<()> {
     if !root_url.starts_with('/') || root_url.starts_with("//") || root_url.contains('#') {
         return Err(AppError::InvalidPackage("invalid offline root URL".into()));
@@ -94,6 +138,7 @@ async fn open_access(app: &AppHandle, root_url: String, access: OfflineAccess) -
           };
           chrome.append(button("←", "Назад", () => action("back")));
           chrome.append(button("NC", "Client Home", () => action("home")));
+          chrome.append(button("LOCK", "Забыть ключи sealed-пакетов", () => action("lock-sealed")));
           const label = document.createElement("div");
           label.className = "nsd-label";
           label.textContent = "OFFLINE PACKAGE";
