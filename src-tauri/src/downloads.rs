@@ -7,7 +7,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::error::{AppError, AppResult};
 use crate::library::{Library, PackageReplacement, ResourceRecord};
@@ -429,46 +429,375 @@ fn object_path(data_dir: &Path, sha256: &str) -> Option<PathBuf> {
     Some(data_dir.join("objects").join(&sha256[..2]).join(sha256))
 }
 
+/// One resource may ask for its missing bytes again after the connection
+/// dies: the `.part` file keeps everything received so far, so only the tail
+/// is requested. Three attempts ride out a flaky link without hiding a dead
+/// one.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+
+enum RangeOutcome {
+    /// The node ignored the range and is sending the whole body.
+    Full,
+    /// The node continues the partial body at `offset`.
+    Resume { offset: u64 },
+    /// The answer cannot continue this file; ask again from scratch.
+    Restart,
+}
+
+/// `Content-Range: bytes <start>-<end>/<total>`, with `*` allowed when the
+/// total is unknown. Anything else does not describe a continuation.
+fn parse_content_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let start = range.split('-').next()?.trim().parse::<u64>().ok()?;
+    let total = match total.trim() {
+        "*" => None,
+        total => Some(total.parse::<u64>().ok()?),
+    };
+    Some((start, total))
+}
+
+fn classify_range_response(
+    status: StatusCode,
+    content_range: Option<&str>,
+    part_len: u64,
+) -> RangeOutcome {
+    match status {
+        StatusCode::PARTIAL_CONTENT => match content_range.and_then(parse_content_range) {
+            // A start anywhere else would splice in bytes this file never
+            // asked for: the size check could still pass, and the hash would
+            // fail much later on somebody else's bytes.
+            Some((start, _)) if start == part_len => RangeOutcome::Resume { offset: part_len },
+            _ => RangeOutcome::Restart,
+        },
+        StatusCode::RANGE_NOT_SATISFIABLE => RangeOutcome::Restart,
+        _ => RangeOutcome::Full,
+    }
+}
+
+/// The manifest identity a partial body may be continued under. Without a
+/// complete `(size, sha256)` pair there is nothing to splice against: a
+/// resumed prefix could be anybody's bytes and the final hash would prove
+/// nothing about where the join happened.
+fn resumable_identity(resource: &ResourceManifest) -> Option<(u64, String)> {
+    let size = resource.size?;
+    let sha256 = resource.sha256.as_deref()?.to_ascii_lowercase();
+    Some((size, sha256))
+}
+
+async fn partial_length(path: &Path) -> u64 {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+        _ => 0,
+    }
+}
+
+/// Hash a leftover body in full — cheap local I/O, and the only way to decide
+/// whether it already is the finished resource.
+async fn hash_file(path: &Path) -> AppResult<String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| storage_error("open partial resource", path, error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| storage_error("read partial resource", path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Open the `.part` for writing. A continuation first re-reads the bytes
+/// already on disk into the hasher: SHA-256 has no shortcut from an offset,
+/// and the final hash must cover the whole body, prefix included.
+async fn open_partial(path: &Path, resume_from: u64) -> AppResult<(tokio::fs::File, Sha256, u64)> {
+    if resume_from == 0 {
+        let file = tokio::fs::File::create(path)
+            .await
+            .map_err(|error| storage_error("create temporary resource", path, error))?;
+        return Ok((file, Sha256::new(), 0));
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|error| storage_error("open temporary resource", path, error))?;
+    let mut hasher = Sha256::new();
+    let mut byte_size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| storage_error("read partial resource", path, error))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        byte_size += read as u64;
+    }
+    file.seek(std::io::SeekFrom::End(0))
+        .await
+        .map_err(|error| storage_error("seek temporary resource", path, error))?;
+    Ok((file, hasher, byte_size))
+}
+
+/// Move a finished `.part` into the content-addressed store, or drop it when
+/// the same bytes are already there.
+async fn store_temporary_object(
+    data_dir: &Path,
+    temporary_path: &Path,
+    sha256: &str,
+    byte_size: u64,
+) -> AppResult<(PathBuf, bool)> {
+    let local_path = object_path(data_dir, sha256)
+        .ok_or_else(|| AppError::Storage("calculated invalid object hash".into()))?;
+    let object_directory = local_path
+        .parent()
+        .ok_or_else(|| AppError::Storage("object path has no parent".into()))?;
+    ensure_object_directory(data_dir, object_directory).await?;
+    let existing = match tokio::fs::symlink_metadata(&local_path).await {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == byte_size => true,
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(temporary_path).await;
+            return Err(AppError::Storage(format!(
+                "invalid existing object at {}",
+                local_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(temporary_path).await;
+            return Err(storage_error("inspect object path", &local_path, error));
+        }
+    };
+    if existing {
+        tokio::fs::remove_file(temporary_path)
+            .await
+            .map_err(|error| storage_error("remove duplicate resource", temporary_path, error))?;
+    } else {
+        tokio::fs::rename(temporary_path, &local_path)
+            .await
+            .map_err(|error| storage_error("store downloaded resource", &local_path, error))?;
+        crate::atomic_file::sync_directory_async(object_directory.to_path_buf()).await?;
+    }
+    Ok((local_path, !existing))
+}
+
+/// A container the manifest does not identify is verified against the hashes
+/// in its own index: a dynamic NSP is rebuilt on every node request, so no
+/// `sha256` exists for the file as a whole and the per-entry hashes are the
+/// only record of what the node packed. A container that carries a manifest
+/// hash needs no second pass — hashing it already covered the index too.
+async fn verify_container(temporary_path: &Path) -> AppResult<()> {
+    let index = crate::nsp::NspIndex::open(temporary_path).await?;
+    index.verify_all().await
+}
+
+struct StreamedBody {
+    byte_size: u64,
+    hasher: Sha256,
+    mime_type: Option<String>,
+}
+
+enum DownloadStop {
+    /// The connection died mid-body. The `.part` keeps the bytes received so
+    /// far, and the caller may ask the node for the rest.
+    Interrupted(String),
+    /// Terminal failure; any `.part` removal the cause required already
+    /// happened where the cause was detected.
+    Fatal(AppError),
+}
+
 async fn download_resource(
     context: &DownloadContext<'_>,
     resource: &ResourceManifest,
     resource_index: usize,
 ) -> AppResult<DownloadedResource> {
-    let app = context.app;
     let state = context.state;
     let session = context.session;
     let download_directory = context.download_directory;
     let package_id = context.package_id;
     let node_origin = context.node_origin;
     let operation_sequence = context.operation_sequence;
-    let resource_count = context.resource_count;
     if !state.session_is_current(session.generation) {
         return Err(AppError::SessionMissing);
     }
-    let response = state
-        .node_client()
-        .get_authenticated(&session.node_url, &resource.url, &session.credential)
-        .await?;
-    validate_resource_status(&resource.url, response.status())?;
-    if resource.size.is_some_and(|size| size > MAX_RESOURCE_BYTES)
-        || response
-            .content_length()
-            .is_some_and(|size| size > MAX_RESOURCE_BYTES)
+    tokio::fs::create_dir_all(download_directory)
+        .await
+        .map_err(|error| storage_error("create download directory", download_directory, error))?;
+    let temporary_path =
+        download_directory.join(format!("resource-{}.part", digest_hex(&resource.url)));
+    let identity = resumable_identity(resource);
+
+    // A crashed attempt can leave a finished body behind. The manifest's
+    // identity checks it without the node: matching bytes already are the
+    // resource, and the node never needs to send them twice.
+    if let Some((expected_size, expected_sha256)) = &identity
+        && *expected_size > 0
+        && partial_length(&temporary_path).await == *expected_size
     {
-        return Err(AppError::Download(format!(
-            "{} exceeds the 128 GiB resource limit",
-            resource.url
-        )));
+        let sha256 = hash_file(&temporary_path).await?;
+        if &sha256 == expected_sha256 {
+            // A completed leftover is stored without touching the node.
+            ensure_current_operation(state, node_origin, package_id, operation_sequence)?;
+            let (local_path, created) =
+                store_temporary_object(&session.data_dir, &temporary_path, &sha256, *expected_size)
+                    .await?;
+            emit(
+                context.app,
+                DownloadEvent {
+                    package_id: Some(package_id.to_owned()),
+                    status: "downloading",
+                    progress: (resource_index + 1) as f64 / context.resource_count.max(1) as f64,
+                    message: format!("Reusing verified partial download {}", resource.url),
+                },
+            );
+            return Ok(DownloadedResource {
+                mime_type: state.library().mime_type_for_resource(
+                    node_origin,
+                    package_id,
+                    &resource.url,
+                    &resource.resource_type,
+                    &sha256,
+                    *expected_size,
+                )?,
+                local_path,
+                byte_size: *expected_size,
+                sha256,
+                created,
+            });
+        }
     }
-    if let (Some(expected), Some(actual)) = (resource.size, response.content_length())
-        && expected != actual
-    {
-        return Err(AppError::Download(format!(
-            "size mismatch for {}",
-            resource.url
-        )));
+
+    let mut attempt = 1;
+    loop {
+        let part_len = partial_length(&temporary_path).await;
+        let ranged = part_len > 0 && identity.is_some();
+        let response = if ranged {
+            state
+                .node_client()
+                .get_ranged(
+                    &session.node_url,
+                    &resource.url,
+                    &session.credential,
+                    part_len,
+                )
+                .await?
+        } else {
+            state
+                .node_client()
+                .get_authenticated(&session.node_url, &resource.url, &session.credential)
+                .await?
+        };
+        let mut resume_from = 0_u64;
+        if ranged {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok());
+            match classify_range_response(response.status(), content_range, part_len) {
+                RangeOutcome::Resume { offset } => resume_from = offset,
+                RangeOutcome::Full => {}
+                RangeOutcome::Restart => {
+                    // The node disagrees with this prefix; drop it and ask
+                    // for the body whole.
+                    let _ = tokio::fs::remove_file(&temporary_path).await;
+                    if attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                        return Err(AppError::Download(format!(
+                            "{} did not answer a resumable request",
+                            resource.url
+                        )));
+                    }
+                    attempt += 1;
+                    continue;
+                }
+            }
+        }
+        validate_resource_status(&resource.url, response.status())?;
+        if resource.size.is_some_and(|size| size > MAX_RESOURCE_BYTES)
+            || response
+                .content_length()
+                .is_some_and(|size| size > MAX_RESOURCE_BYTES)
+        {
+            return Err(AppError::Download(format!(
+                "{} exceeds the 128 GiB resource limit",
+                resource.url
+            )));
+        }
+        if let (Some(expected), Some(actual)) = (resource.size, response.content_length())
+            && expected != actual.saturating_add(resume_from)
+        {
+            return Err(AppError::Download(format!(
+                "size mismatch for {}",
+                resource.url
+            )));
+        }
+        match stream_body(
+            context,
+            resource,
+            resource_index,
+            response,
+            &temporary_path,
+            resume_from,
+        )
+        .await
+        {
+            Ok(body) => {
+                return finalize_resource(context, resource, identity, body, &temporary_path).await;
+            }
+            Err(DownloadStop::Fatal(error)) => return Err(error),
+            Err(DownloadStop::Interrupted(error)) => {
+                // Without a manifest identity nothing can be continued, so a
+                // lost connection fails the resource as it always has;
+                // resumable resources get the rest asked for again.
+                if identity.is_none() {
+                    return Err(AppError::Download(error));
+                }
+                if attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                    return Err(AppError::Download(format!(
+                        "connection to {} was lost {MAX_DOWNLOAD_ATTEMPTS} times in a row: {error}",
+                        resource.url
+                    )));
+                }
+                attempt += 1;
+                emit(
+                    context.app,
+                    DownloadEvent {
+                        package_id: Some(package_id.to_owned()),
+                        status: "downloading",
+                        progress: resource_index as f64 / context.resource_count.max(1) as f64,
+                        message: format!("Resuming {}", resource.url),
+                    },
+                );
+            }
+        }
     }
-    let expected_size = resource.size.or(response.content_length());
+}
+
+/// Stream one response body into the `.part`, hashing as it arrives. A
+/// continuation is already half-hashed by `open_partial`, so the digest at the
+/// end always spans the whole resource, however many attempts it took.
+async fn stream_body(
+    context: &DownloadContext<'_>,
+    resource: &ResourceManifest,
+    resource_index: usize,
+    response: reqwest::Response,
+    temporary_path: &Path,
+    resume_from: u64,
+) -> Result<StreamedBody, DownloadStop> {
+    let app = context.app;
+    let state = context.state;
+    let session = context.session;
+    let package_id = context.package_id;
+    let resource_count = context.resource_count;
     // Sealed endpoints answer `application/octet-stream` for everything, so a
     // sealed resource carries its serving mime in the manifest instead. Plain
     // resources keep trusting the response header, as before.
@@ -479,40 +808,57 @@ async fn download_resource(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
     });
-    tokio::fs::create_dir_all(download_directory)
-        .await
-        .map_err(|error| storage_error("create download directory", download_directory, error))?;
-    let temporary_path =
-        download_directory.join(format!("resource-{}.part", digest_hex(&resource.url)));
-    let mut file = tokio::fs::File::create(&temporary_path)
-        .await
-        .map_err(|error| storage_error("create temporary resource", &temporary_path, error))?;
+    let expected_size = resource.size.or_else(|| {
+        let content_length = response.content_length()?;
+        Some(if resume_from > 0 {
+            resume_from.saturating_add(content_length)
+        } else {
+            content_length
+        })
+    });
+    let (mut file, mut hasher, mut byte_size) =
+        match open_partial(temporary_path, resume_from).await {
+            Ok(opened) => opened,
+            Err(error) => return Err(DownloadStop::Fatal(error)),
+        };
     let mut stream = response.bytes_stream();
-    let mut hasher = Sha256::new();
-    let mut byte_size = 0_u64;
     let mut last_percent = (resource_index * 100 / resource_count.max(1)) as u32;
     while let Some(chunk) = stream.next().await {
         if !state.session_is_current(session.generation) {
             drop(file);
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            return Err(AppError::SessionMissing);
+            let _ = tokio::fs::remove_file(temporary_path).await;
+            return Err(DownloadStop::Fatal(AppError::SessionMissing));
         }
-        let chunk = chunk.map_err(|error| AppError::Download(error.to_string()))?;
-        byte_size = byte_size
-            .checked_add(chunk.len() as u64)
-            .ok_or_else(|| AppError::Storage("resource size overflow".into()))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                // Everything received so far is still this resource's own
+                // prefix; keep it, flush what the file may hold buffered, and
+                // let the caller request the rest.
+                let _ = file.flush().await;
+                drop(file);
+                return Err(DownloadStop::Interrupted(error.to_string()));
+            }
+        };
+        byte_size = byte_size.checked_add(chunk.len() as u64).ok_or_else(|| {
+            DownloadStop::Fatal(AppError::Storage("resource size overflow".into()))
+        })?;
         if byte_size > MAX_RESOURCE_BYTES {
             drop(file);
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            return Err(AppError::Download(format!(
+            let _ = tokio::fs::remove_file(temporary_path).await;
+            return Err(DownloadStop::Fatal(AppError::Download(format!(
                 "{} exceeds the 128 GiB resource limit",
                 resource.url
-            )));
+            ))));
         }
         hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|error| storage_error("write temporary resource", &temporary_path, error))?;
+        if let Err(error) = file.write_all(&chunk).await {
+            return Err(DownloadStop::Fatal(storage_error(
+                "write temporary resource",
+                temporary_path,
+                error,
+            )));
+        }
         if let Some(expected_size) = expected_size.filter(|size| *size > 0) {
             let resource_progress = (byte_size as f64 / expected_size as f64).min(1.0);
             let progress =
@@ -532,16 +878,48 @@ async fn download_resource(
             }
         }
     }
-    file.flush()
-        .await
-        .map_err(|error| storage_error("flush temporary resource", &temporary_path, error))?;
-    file.sync_all()
-        .await
-        .map_err(|error| storage_error("sync temporary resource", &temporary_path, error))?;
+    if let Err(error) = file.flush().await {
+        return Err(DownloadStop::Fatal(storage_error(
+            "flush temporary resource",
+            temporary_path,
+            error,
+        )));
+    }
+    if let Err(error) = file.sync_all().await {
+        return Err(DownloadStop::Fatal(storage_error(
+            "sync temporary resource",
+            temporary_path,
+            error,
+        )));
+    }
     drop(file);
+    Ok(StreamedBody {
+        byte_size,
+        hasher,
+        mime_type,
+    })
+}
 
+/// Verify a streamed body against the manifest, check a dynamic container
+/// against its own index, and publish the bytes into the object store.
+async fn finalize_resource(
+    context: &DownloadContext<'_>,
+    resource: &ResourceManifest,
+    identity: Option<(u64, String)>,
+    body: StreamedBody,
+    temporary_path: &Path,
+) -> AppResult<DownloadedResource> {
+    let state = context.state;
+    let session = context.session;
+    let package_id = context.package_id;
+    let node_origin = context.node_origin;
+    let StreamedBody {
+        byte_size,
+        hasher,
+        mime_type,
+    } = body;
     if resource.size.is_some_and(|expected| expected != byte_size) {
-        let _ = tokio::fs::remove_file(&temporary_path).await;
+        let _ = tokio::fs::remove_file(temporary_path).await;
         return Err(AppError::Download(format!(
             "size mismatch for {}",
             resource.url
@@ -553,54 +931,35 @@ async fn download_resource(
         .as_ref()
         .is_some_and(|expected| !expected.eq_ignore_ascii_case(&sha256))
     {
-        let _ = tokio::fs::remove_file(&temporary_path).await;
+        let _ = tokio::fs::remove_file(temporary_path).await;
         return Err(AppError::Download(format!(
             "SHA-256 mismatch for {}",
             resource.url
         )));
     }
-    if let Err(error) = ensure_current_operation(state, node_origin, package_id, operation_sequence)
-    {
-        let _ = tokio::fs::remove_file(&temporary_path).await;
-        return Err(error);
-    }
-    let local_path = object_path(&session.data_dir, &sha256)
-        .ok_or_else(|| AppError::Storage("calculated invalid object hash".into()))?;
-    let object_directory = local_path
-        .parent()
-        .ok_or_else(|| AppError::Storage("object path has no parent".into()))?;
-    ensure_object_directory(&session.data_dir, object_directory).await?;
-    let existing = match tokio::fs::symlink_metadata(&local_path).await {
-        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == byte_size => true,
-        Ok(_) => {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            return Err(AppError::Storage(format!(
-                "invalid existing object at {}",
-                local_path.display()
+    if identity.is_none() && resource.resource_type == "container" {
+        if let Err(error) = verify_container(temporary_path).await {
+            let _ = tokio::fs::remove_file(temporary_path).await;
+            return Err(AppError::Download(format!(
+                "{} failed container verification: {error}",
+                resource.url
             )));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            return Err(storage_error("inspect object path", &local_path, error));
-        }
-    };
-    if existing {
-        tokio::fs::remove_file(&temporary_path)
-            .await
-            .map_err(|error| storage_error("remove duplicate resource", &temporary_path, error))?;
-    } else {
-        tokio::fs::rename(&temporary_path, &local_path)
-            .await
-            .map_err(|error| storage_error("store downloaded resource", &local_path, error))?;
-        crate::atomic_file::sync_directory_async(object_directory.to_path_buf()).await?;
     }
+    if let Err(error) =
+        ensure_current_operation(state, node_origin, package_id, context.operation_sequence)
+    {
+        let _ = tokio::fs::remove_file(temporary_path).await;
+        return Err(error);
+    }
+    let (local_path, created) =
+        store_temporary_object(&session.data_dir, temporary_path, &sha256, byte_size).await?;
     Ok(DownloadedResource {
         local_path,
         mime_type,
         byte_size,
         sha256,
-        created: !existing,
+        created,
     })
 }
 
@@ -953,12 +1312,15 @@ fn emit(app: &AppHandle, event: DownloadEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModuleManifest, PackageManifest, ResourceManifest, gc_unreferenced_objects, is_object_path,
-        object_path, reusable_object, validate_manifest, validate_package_id,
-        validate_resource_status,
+        ModuleManifest, PackageManifest, RangeOutcome, ResourceManifest, classify_range_response,
+        gc_unreferenced_objects, hash_file, is_object_path, object_path, open_partial,
+        parse_content_range, resumable_identity, reusable_object, validate_manifest,
+        validate_package_id, validate_resource_status,
     };
     use crate::error::AppError;
     use crate::library::{Library, PackageReplacement, ResourceRecord};
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
 
     fn resource(sha256: Option<&str>, size: Option<u64>) -> ResourceManifest {
         ResourceManifest {
@@ -1221,5 +1583,125 @@ mod tests {
 
         assert!(referenced_path.is_file());
         assert!(!orphan_path.exists());
+    }
+
+    #[test]
+    fn parse_content_range_reads_start_and_total() {
+        assert_eq!(parse_content_range("bytes 5-9/10"), Some((5, Some(10))));
+        assert_eq!(parse_content_range("bytes 0-0/1"), Some((0, Some(1))));
+        // An unknown total still describes where the body continues.
+        assert_eq!(parse_content_range("bytes 5-9/*"), Some((5, None)));
+    }
+
+    #[test]
+    fn parse_content_range_rejects_foreign_shapes() {
+        assert_eq!(parse_content_range("items 5-9/10"), None);
+        assert_eq!(parse_content_range("bytes x-9/10"), None);
+        assert_eq!(parse_content_range("bytes 5-9"), None);
+        assert_eq!(parse_content_range("bytes 5-9/ten"), None);
+        assert_eq!(parse_content_range(""), None);
+    }
+
+    #[test]
+    fn classify_range_response_picks_safe_continuation() {
+        use reqwest::StatusCode;
+
+        // The node continues exactly where the partial body stopped.
+        assert!(matches!(
+            classify_range_response(StatusCode::PARTIAL_CONTENT, Some("bytes 5-9/10"), 5),
+            RangeOutcome::Resume { offset: 5 }
+        ));
+        // A different start means those bytes belong to another file.
+        assert!(matches!(
+            classify_range_response(StatusCode::PARTIAL_CONTENT, Some("bytes 7-9/10"), 5),
+            RangeOutcome::Restart
+        ));
+        // So does an answer that does not describe a range at all.
+        assert!(matches!(
+            classify_range_response(StatusCode::PARTIAL_CONTENT, None, 5),
+            RangeOutcome::Restart
+        ));
+        // The requested range starts past the end: ask again without one.
+        assert!(matches!(
+            classify_range_response(StatusCode::RANGE_NOT_SATISFIABLE, None, 5),
+            RangeOutcome::Restart
+        ));
+        // The node ignored the header and is sending the whole body.
+        assert!(
+            matches!(
+                classify_range_response(StatusCode::OK, None, 5),
+                RangeOutcome::Full
+            ),
+            "a plain 200 must restart the body, not resume it"
+        );
+    }
+
+    #[test]
+    fn resume_requires_complete_manifest_identity() {
+        let hash = "ab".repeat(32);
+        // Both halves of the identity are required...
+        let identity = resumable_identity(&resource(Some(&hash), Some(4))).unwrap();
+        assert_eq!(identity, (4, hash.clone()));
+        // ...and uppercase input arrives normalized for comparison.
+        let upper = "AB".repeat(32);
+        assert_eq!(
+            resumable_identity(&resource(Some(&upper), Some(4)))
+                .unwrap()
+                .1,
+            "ab".repeat(32)
+        );
+        // Without either half there is nothing to splice a prefix against.
+        assert!(resumable_identity(&resource(None, Some(4))).is_none());
+        assert!(resumable_identity(&resource(Some(&hash), None)).is_none());
+        assert!(resumable_identity(&resource(None, None)).is_none());
+        // Sealed resources never carry identity and never resume.
+        assert!(resumable_identity(&sealed_resource("/sealed")).is_none());
+    }
+
+    #[tokio::test]
+    async fn hash_file_covers_the_whole_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body");
+        tokio::fs::write(&path, b"hello").await.unwrap();
+
+        assert_eq!(
+            hash_file(&path).await.unwrap(),
+            format!("{:x}", Sha256::digest(b"hello"))
+        );
+    }
+
+    #[tokio::test]
+    async fn open_partial_rehashes_the_prefix_before_appending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body.part");
+        tokio::fs::write(&path, b"hel").await.unwrap();
+
+        let (mut file, mut hasher, byte_size) = open_partial(&path, 3).await.unwrap();
+        assert_eq!(byte_size, 3);
+        // The tail arrives exactly as `stream_body` feeds it: into the file
+        // and into the hasher seeded with the prefix.
+        hasher.update(b"lo");
+        file.write_all(b"lo").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        // The hasher saw the bytes already on disk, so the digest spans the
+        // whole body, not just the resumed tail.
+        assert_eq!(
+            format!("{:x}", hasher.finalize()),
+            format!("{:x}", Sha256::digest(b"hello"))
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn open_partial_from_zero_truncates_the_stale_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("body.part");
+        tokio::fs::write(&path, b"stale bytes").await.unwrap();
+
+        let (_file, _, byte_size) = open_partial(&path, 0).await.unwrap();
+        assert_eq!(byte_size, 0);
+        assert_eq!(tokio::fs::metadata(&path).await.unwrap().len(), 0);
     }
 }
