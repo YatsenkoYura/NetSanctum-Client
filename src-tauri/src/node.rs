@@ -170,6 +170,35 @@ impl NodeClient {
         relative_url: &str,
         credential: &SessionCredential,
     ) -> AppResult<reqwest::Response> {
+        self.authenticated_request(node_url, relative_url, credential)?
+            .send()
+            .await
+            .map_err(|error| AppError::Download(safe_network_error(&error)))
+    }
+
+    /// A ranged GET for continuing a partially written download. Only the
+    /// node's answer says whether the range resumed anything: `206` continues
+    /// the file at `start`, anything else makes the caller start over.
+    pub async fn get_ranged(
+        &self,
+        node_url: &Url,
+        relative_url: &str,
+        credential: &SessionCredential,
+        start: u64,
+    ) -> AppResult<reqwest::Response> {
+        self.authenticated_request(node_url, relative_url, credential)?
+            .header(reqwest::header::RANGE, format!("bytes={start}-"))
+            .send()
+            .await
+            .map_err(|error| AppError::Download(safe_network_error(&error)))
+    }
+
+    fn authenticated_request(
+        &self,
+        node_url: &Url,
+        relative_url: &str,
+        credential: &SessionCredential,
+    ) -> AppResult<reqwest::RequestBuilder> {
         if !relative_url.starts_with('/') || relative_url.starts_with("//") {
             return Err(AppError::InvalidPackage(
                 "resource URL must be an absolute path".into(),
@@ -190,10 +219,7 @@ impl NodeClient {
                 request.header(COOKIE, format!("access_token={}", session_id.as_str()))
             }
         };
-        request
-            .send()
-            .await
-            .map_err(|error| AppError::Download(safe_network_error(&error)))
+        Ok(request)
     }
 
     pub async fn check_authenticated(
