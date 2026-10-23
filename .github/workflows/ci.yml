@@ -44,7 +44,7 @@ jobs:
       matrix:
         include:
           - os: linux
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - os: windows
             runner: windows-2025
           - os: macos
