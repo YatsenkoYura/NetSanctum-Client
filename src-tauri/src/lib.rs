@@ -17,6 +17,7 @@ mod offline_gateway;
 mod offline_view;
 mod sealed;
 mod state;
+mod voice;
 #[cfg(not(mobile))]
 mod window_chrome;
 
@@ -515,6 +516,7 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::new(&data_dir).map_err(|error| error.to_string())?;
             app.manage(state);
+            app.manage(voice::VoiceState::default());
             #[cfg(not(mobile))]
             {
                 let tray_available = window_chrome::install_tray(app).is_ok();
@@ -571,6 +573,10 @@ pub fn run() {
             show_home,
             navigate_back,
             hide_to_tray,
+            voice::voice_start,
+            voice::voice_push_pcm,
+            voice::voice_finish,
+            voice::voice_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("Netsanctum Client runtime failed");
