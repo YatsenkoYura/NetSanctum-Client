@@ -552,7 +552,14 @@ class NodeViewPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         override fun onPermissionRequest(request: PermissionRequest) {
-          request.deny()
+          // Voice-first MIKU needs mic access; everything else stays denied.
+          val audioOnly = request.resources.isNotEmpty() &&
+            request.resources.all { it == PermissionRequest.RESOURCE_AUDIO_CAPTURE }
+          if (audioOnly) {
+            request.grant(request.resources)
+          } else {
+            request.deny()
+          }
         }
 
         override fun onJsAlert(view: WebView, url: String, message: String, result: JsResult): Boolean {
