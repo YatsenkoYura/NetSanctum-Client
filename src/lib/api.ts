@@ -198,3 +198,75 @@ export function navigateBack(): Promise<void> {
 export function hideToTray(): Promise<void> {
   return invoke("hide_to_tray");
 }
+
+export interface VoiceInfo {
+  sampleRate: number;
+  maxSeconds: number;
+}
+
+export interface VoiceLevel {
+  db: number;
+  speech: boolean;
+  bufferedSeconds: number;
+}
+
+export interface VoiceClip {
+  wavBase64: string;
+  seconds: number;
+  maxDb: number;
+  speechChunks: number;
+}
+
+export function voiceStart(sampleRate?: number): Promise<VoiceInfo> {
+  return invoke("voice_start", { sampleRate: sampleRate ?? null });
+}
+
+export function voicePushPcm(chunkBase64: string): Promise<VoiceLevel> {
+  return invoke("voice_push_pcm", { chunkBase64 });
+}
+
+export function voiceFinish(): Promise<VoiceClip> {
+  return invoke("voice_finish");
+}
+
+export function voiceCancel(): Promise<void> {
+  return invoke("voice_cancel");
+}
+
+export interface WakeStatus {
+  enabled: boolean;
+  models: string[];
+  featureModelsReady: boolean;
+}
+
+export interface WakeScores {
+  scores: Record<string, number>;
+}
+
+export function wakeEnsureModels(): Promise<string[]> {
+  return invoke("wake_ensure_models");
+}
+
+export function wakeEnable(
+  models: string[],
+  threshold?: number,
+  cooldownSecs?: number,
+): Promise<WakeStatus> {
+  return invoke("wake_enable", { models, threshold: threshold ?? null, cooldownSecs: cooldownSecs ?? null });
+}
+
+export function wakeLoadCustom(name: string, modelBase64: string): Promise<string> {
+  return invoke("wake_load_custom", { name, modelBase64 });
+}
+
+export function wakeDisable(): Promise<WakeStatus> {
+  return invoke("wake_disable");
+}
+
+export function wakeStatus(): Promise<WakeStatus> {
+  return invoke("wake_status");
+}
+
+export function wakePushPcm(chunkBase64: string): Promise<WakeScores> {
+  return invoke("wake_push_pcm", { chunkBase64 });
+}
