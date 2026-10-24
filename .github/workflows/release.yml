@@ -72,13 +72,13 @@ jobs:
           - name: Windows x86_64
             runner: windows-2025
             args: --bundles nsis,msi
-          - name: macOS Apple Silicon
-            runner: macos-15
-            args: --target aarch64-apple-darwin --bundles dmg
-          # No macOS Intel build: ort-sys ships no prebuilt onnxruntime for
-          # x86_64-apple-darwin, and CI has only ever compiled macOS aarch64.
-          # Shipping Intel would mean building onnxruntime from source or
-          # parking the wake engine behind a feature flag.
+          # No macOS builds for now: ort-sys ships no prebuilt onnxruntime for
+          # x86_64-apple-darwin (so Intel could never link since the wake engine
+          # made ort a dependency), and Apple Silicon - though buildable - has
+          # no runtime testing behind it. Voice and wake stay unshipped on Mac
+          # until someone actually uses the platform. Local builds from source
+          # are unaffected; the tauri-action darwin target switch below is kept
+          # so a return only needs this matrix entry back.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
