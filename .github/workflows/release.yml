@@ -75,9 +75,10 @@ jobs:
           - name: macOS Apple Silicon
             runner: macos-15
             args: --target aarch64-apple-darwin --bundles dmg
-          - name: macOS Intel
-            runner: macos-15
-            args: --target x86_64-apple-darwin --bundles dmg
+          # No macOS Intel build: ort-sys ships no prebuilt onnxruntime for
+          # x86_64-apple-darwin, and CI has only ever compiled macOS aarch64.
+          # Shipping Intel would mean building onnxruntime from source or
+          # parking the wake engine behind a feature flag.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
